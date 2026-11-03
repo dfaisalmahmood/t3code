@@ -63,7 +63,7 @@ import {
   ThreadId,
   isOrchestrationV2WorkActive,
 } from "@t3tools/contracts";
-import { getProviderOptionCurrentValue } from "@t3tools/shared/model";
+import { resolveProviderForCwd, getProviderOptionCurrentValue } from "@t3tools/shared/model";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
 import {
@@ -1288,6 +1288,21 @@ const make = Effect.gen(function* () {
   });
 
   const loadProviders = providerRegistry.getProviders;
+  const scopeProviders = Effect.fn("OrchestratorMcpService.scopeProviders")(function* (
+    providers: ReadonlyArray<ServerProvider>,
+    parent: Pick<OrchestrationV2ThreadProjection, "thread"> | undefined,
+  ) {
+    if (
+      !parent ||
+      !providers.some((provider) =>
+        provider.workspaceSnapshots?.some((snapshot) => snapshot.models !== undefined),
+      )
+    )
+      return providers;
+    const cwd =
+      parent.thread.worktreePath ?? (yield* requireProject(parent.thread.projectId)).workspaceRoot;
+    return providers.map((provider) => resolveProviderForCwd(provider, cwd));
+  });
 
   const loadOrchestrationCapableInstanceIds = () =>
     providerAdapters.list().pipe(Effect.map((instanceIds) => new Set(instanceIds)));
@@ -1332,13 +1347,14 @@ const make = Effect.gen(function* () {
     /** Receipt replays bypass current settings because they start no work. Dispatch must reuse the checked command ID. */
     readonly skipProjectEnablementFilter?: boolean;
   }): Effect.fn.Return<ResolvedTarget, OrchestratorMcpFailure> {
+    const providers = yield* scopeProviders(input.providers, input.parent);
     const requestedInstanceId = input.target?.providerInstanceId;
     const requestedDriver = input.target?.driverKind;
     const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
     let instanceId = requestedInstanceId;
 
     if (instanceId === undefined && requestedDriver !== undefined) {
-      const candidates = input.providers.filter(
+      const candidates = providers.filter(
         (provider) =>
           provider.driver === requestedDriver &&
           orchestrationCapableInstanceIds.has(provider.instanceId),
@@ -1382,7 +1398,7 @@ const make = Effect.gen(function* () {
     }
     instanceId ??= input.parent.thread.modelSelection.instanceId;
 
-    const provider = input.providers.find((candidate) => candidate.instanceId === instanceId);
+    const provider = providers.find((candidate) => candidate.instanceId === instanceId);
     if (provider === undefined) {
       return yield* failure(
         "provider_unavailable",
@@ -1419,14 +1435,15 @@ const make = Effect.gen(function* () {
         `Provider ${instanceId} has no model available for inheritance.`,
       );
     }
+    const hasScopedModels =
+      provider !== input.providers.find((candidate) => candidate.instanceId === instanceId);
     if (
-      requestedModel !== undefined &&
-      provider.models.length > 0 &&
-      !provider.models.some((candidate) => candidate.slug === requestedModel)
+      (hasScopedModels || (requestedModel !== undefined && provider.models.length > 0)) &&
+      !provider.models.some((candidate) => candidate.slug === model)
     ) {
       return yield* failure(
         "model_unavailable",
-        `Model ${requestedModel} is not advertised by provider ${instanceId}.`,
+        `Model ${model} is not advertised by provider ${instanceId}.`,
       );
     }
 
@@ -2253,7 +2270,9 @@ const make = Effect.gen(function* () {
 
     capabilities: Effect.fn("OrchestratorMcpService.capabilities")(function* (scope, input = {}) {
       const { parent, limits } = yield* loadCaller(scope);
-      const providers = yield* loadProviders;
+      const providers = yield* loadProviders.pipe(
+        Effect.flatMap((providers) => scopeProviders(providers, parent)),
+      );
       const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
       const settings = yield* serverSettings.getSettings.pipe(
         Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),

@@ -189,6 +189,15 @@ const ThreadTransferTool = Tool.make("t3_thread_transfer", {
   ]),
 }).annotate(Tool.Destructive, true);
 
+const ThreadSnoozeTool = Tool.make("t3_thread_snooze", {
+  ...commandTool,
+  description:
+    "Snooze this calling thread until snoozedUntil. Cannot target another thread or environment, settle, or archive.",
+  parameters: Schema.Struct({ snoozedUntil: IsoDateTime }),
+})
+  .annotate(Tool.Strict, true)
+  .annotate(Tool.Destructive, false);
+
 const ThreadSearchTool = Tool.make("t3_thread_search", {
   ...commandTool,
   description:
@@ -243,6 +252,7 @@ export const ThreadToolkit = Toolkit.make(
   ThreadConfigureTool,
   ThreadTransferTool,
   ThreadOrganizeTool,
+  ThreadSnoozeTool,
   PendingRequestTool,
   QueueTool,
 );

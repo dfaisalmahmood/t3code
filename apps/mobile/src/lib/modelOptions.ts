@@ -1,3 +1,4 @@
+import { resolveProviderForCwd } from "@t3tools/shared/model";
 import {
   normalizeProviderAccentColor,
   resolveProviderInstanceDisplayName,
@@ -277,12 +278,19 @@ export function resolveNewTaskModelSelection(input: {
 }
 
 export function buildModelOptions(
-  config: T3ServerConfig | null | undefined,
+  machineConfig: T3ServerConfig | null | undefined,
   fallbackModelSelection: ModelSelection | null,
   providerInstanceId: ModelSelection["instanceId"] | undefined,
   projectId: ProjectId | null,
   includeHidden = false,
+  cwd?: string | null,
 ): ReadonlyArray<ModelOption> {
+  const config = machineConfig
+    ? {
+        ...machineConfig,
+        providers: machineConfig.providers.map((provider) => resolveProviderForCwd(provider, cwd)),
+      }
+    : machineConfig;
   const options = new Map<string, ModelOption>();
   const lockedProvider = config?.providers.find(
     (provider) => provider.instanceId === providerInstanceId,

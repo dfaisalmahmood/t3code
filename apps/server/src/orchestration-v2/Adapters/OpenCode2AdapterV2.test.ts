@@ -422,6 +422,185 @@ const history = {
 };
 
 it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
+  it.effect(
+    "keeps an explicit primary agent and its restrictions through resume and compaction",
+    () =>
+      Effect.gen(function* () {
+        const permissions = [
+          { action: "*", resource: "*", effect: "ask" },
+          { action: "shell", resource: "*", effect: "deny" },
+          { action: "edit", resource: "*", effect: "deny" },
+        ];
+        const compiled = [
+          ...permissions,
+          { action: "subagent", resource: "*", effect: "deny" },
+          { action: "t3-code-*", resource: "*", effect: "deny" },
+        ];
+        const selection: ModelSelection = {
+          ...bigPickle,
+          options: [{ id: "agent", value: "mason" }],
+        };
+        const listed = reply("agent.list", {
+          ...agentList,
+          data: [{ ...agentList.data[0], id: "mason", name: "Mason", permissions }],
+        });
+        const planCompiled = [
+          ...permissions,
+          { action: "edit", resource: "*", effect: "deny" },
+          ...compiled.slice(permissions.length),
+        ];
+        const askedPermissions = [
+          ...permissions,
+          { action: "shell", resource: "*", effect: "ask" },
+        ];
+        const askedCompiled = [...askedPermissions, ...compiled.slice(permissions.length)];
+        const runtime = yield* openCode2ReplayRuntimeWithInstructions([
+          ...opening,
+          out("agent.list", "<any>"),
+          reply("agent.list", {
+            ...agentList,
+            data: [{ ...agentList.data[0], id: "mason", name: "Mason", permissions }],
+          }),
+          out("session.create", {
+            location: { directory: WORK },
+            model: { providerID: "opencode", id: "big-pickle" },
+            agent: "mason",
+            permissions: compiled,
+          }),
+          replyData("session.create", sessionInfo({ agent: "mason", permissions: compiled })),
+          out("session.get", { sessionID: SESSION }),
+          replyData("session.get", sessionInfo({ agent: "build" })),
+          ...noOpenRequests,
+          out("agent.list", "<any>"),
+          listed,
+          out("session.update", { sessionID: SESSION, permissions: compiled }),
+          reply("session.update", null),
+          out("session.switchAgent", { sessionID: SESSION, agent: "mason" }),
+          reply("session.switchAgent", null),
+          out("agent.list", "<any>"),
+          listed,
+          out("session.update", { sessionID: SESSION, permissions: planCompiled }),
+          reply("session.update", null),
+          out("session.compact", { sessionID: SESSION, id: "<any>" }),
+          replyData("session.compact", {
+            id: PROMPT_ID,
+            sessionID: SESSION,
+            time: { created: 1790656601410 },
+            type: "compaction",
+            payload: {},
+            delivery: "steer",
+          }),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+          out("agent.list", "<any>"),
+          reply("agent.list", {
+            ...agentList,
+            data: [
+              { ...agentList.data[0], id: "mason", name: "Mason", permissions: askedPermissions },
+            ],
+          }),
+          out("session.update", { sessionID: SESSION, permissions: askedCompiled }),
+          reply("session.update", null),
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          shellAskEvent,
+          out("agent.list", "<any>"),
+          listed,
+          out("session.update", { sessionID: SESSION, permissions: compiled }),
+          reply("session.update", null),
+          out("permission.reply", {
+            sessionID: SESSION,
+            requestID: shellAsk.data.id,
+            decision: "reject",
+          }),
+          reply("permission.reply", null),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+        ]);
+        const thread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection: selection,
+          runtimePolicy: policy(),
+        });
+        assert.deepEqual(thread.nativeMetadata?.modelSelection?.options, [
+          { id: "variant", value: "default" },
+          { id: "agent", value: "mason" },
+        ]);
+        assert.isDefined(runtime.unloadThread);
+        yield* runtime.unloadThread!({ providerThread: thread });
+        const resumed = yield* runtime.resumeThread({
+          threadId,
+          providerThread: thread,
+          runtimePolicy: policy(),
+        });
+        const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        assert.isDefined(runtime.compactThread);
+        yield* runtime.compactThread!({
+          ...turnInput(resumed, selection),
+          runtimePolicy: { ...policy(), interactionMode: "plan" },
+        });
+        assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+        const requested = yield* requestOf(runtime).pipe(Effect.forkScoped);
+        const nextTerminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        yield* runtime.startTurn({
+          ...turnInput(resumed, selection),
+          attemptId: RunAttemptId.make("attempt:role-approval"),
+        });
+        const request = yield* Fiber.join(requested);
+        yield* runtime.respondToRuntimeRequest({
+          requestId: request!.id,
+          decision: "acceptForSession",
+        });
+        assert.equal((yield* Fiber.join(nextTerminal))?.status, "completed");
+        assert.equal(
+          resumed.nativeMetadata?.modelSelection?.options?.find((option) => option.id === "agent")
+            ?.value,
+          "mason",
+        );
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("rejects a removed persisted role on cold resume without a repeated selection", () =>
+    Effect.gen(function* () {
+      const runtime = yield* openCode2ReplayRuntime([
+        ...opening,
+        out("session.get", { sessionID: SESSION }),
+        replyData("session.get", sessionInfo({ agent: "mason" })),
+        ...noOpenRequests,
+        out("agent.list", "<any>"),
+        reply("agent.list", agentList),
+      ]);
+      const thread = {
+        ...providerThread(yield* DateTime.now),
+        nativeMetadata: {
+          modelSelection: { ...bigPickle, options: [{ id: "agent", value: "mason" }] },
+        },
+      };
+      const result = yield* runtime
+        .resumeThread({ threadId, providerThread: thread, runtimePolicy: policy() })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(result));
+      if (Exit.isFailure(result)) assert.include(Cause.pretty(result.cause), "mason");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("rejects a missing explicit agent before creating a native session", () =>
+    Effect.gen(function* () {
+      const runtime = yield* openCode2ReplayRuntime([
+        ...opening,
+        out("agent.list", "<any>"),
+        reply("agent.list", agentList),
+      ]);
+      const result = yield* runtime
+        .ensureThread({
+          threadId,
+          modelSelection: { ...bigPickle, options: [{ id: "agent", value: "missing" }] },
+          runtimePolicy: policy(),
+        })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(result));
+      if (Exit.isFailure(result)) assert.include(Cause.pretty(result.cause), "missing");
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("switches the session's model and variant before a turn that changed them", () =>
     Effect.gen(function* () {
       const { runtime, thread } = yield* resumed([

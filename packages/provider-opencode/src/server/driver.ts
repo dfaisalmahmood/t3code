@@ -28,6 +28,7 @@ import {
   checkOpenCodeProviderStatus,
   loadOpenCode2Workspace,
   makeOpenCode2ModelLoader,
+  openCode2ModelsToServerProviderModels,
   makePendingOpenCodeProvider,
   openCode2CommandsToServerProviderSlashCommands,
   openCode2SkillsToServerProviderSkills,
@@ -286,9 +287,25 @@ export const OpenCodeDriver: ProviderDriver<
         Effect.provideService(OpenCode2Server.OpenCode2Server, openCode2Server),
       ),
     });
-    const loadOpenCode2Models = yield* makeOpenCode2ModelLoader(
-      openCode2Server.withConnection(({ client }) => loadOpenCode2Catalog(client, host.paths.cwd)),
-    );
+    const modelLoaders = new Map<
+      string,
+      Effect.Success<
+        ReturnType<typeof makeOpenCode2ModelLoader<OpenCodeRuntime.OpenCodeRuntimeError>>
+      >
+    >();
+    const loadOpenCode2ModelsForCwd = Effect.fn("OpencodeDriver.loadModelsForCwd")(function* (
+      cwd: string,
+    ) {
+      let loader = modelLoaders.get(cwd);
+      if (loader === undefined) {
+        loader = yield* makeOpenCode2ModelLoader(
+          openCode2Server.withConnection(({ client }) => loadOpenCode2Catalog(client, cwd)),
+        );
+        modelLoaders.set(cwd, loader);
+      }
+      return yield* loader;
+    });
+    const loadOpenCode2Models = loadOpenCode2ModelsForCwd(host.paths.cwd);
     const listOpenCode2Workspace = (cwd: string) =>
       openCode2Server.withConnection(({ client, events }) =>
         Effect.gen(function* () {
@@ -488,6 +505,17 @@ export const OpenCodeDriver: ProviderDriver<
           : byOpenCodeRuntime(runtimeProbe.get, {
               v2: Effect.all([
                 snapshot.getSnapshot,
+                loadOpenCode2ModelsForCwd(cwd).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderDriverError({
+                        driver: DRIVER_KIND,
+                        instanceId,
+                        detail: `Failed to list OpenCode models for '${cwd}'`,
+                        cause,
+                      }),
+                  ),
+                ),
                 listOpenCode2Workspace(cwd).pipe(
                   Effect.timeout("20 seconds"),
                   Effect.mapError(
@@ -501,8 +529,12 @@ export const OpenCodeDriver: ProviderDriver<
                   ),
                 ),
               ]).pipe(
-                Effect.map(([machineSnapshot, { skills, commands }]) => ({
+                Effect.map(([machineSnapshot, models, { skills, commands }]) => ({
                   ...machineSnapshot,
+                  models: openCode2ModelsToServerProviderModels(
+                    models,
+                    effectiveConfig.customModels,
+                  ),
                   skills: openCode2SkillsToServerProviderSkills(skills),
                   slashCommands: openCode2CommandsToServerProviderSlashCommands(commands),
                   // A finished scan lists at least the built-ins. None means it

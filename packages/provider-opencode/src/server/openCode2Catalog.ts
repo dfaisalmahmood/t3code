@@ -17,13 +17,19 @@ export const loadOpenCode2Catalog = (
   return Effect.all(
     {
       models: client.model.list({ location }),
+      agents: client.agent
+        .list({ location })
+        .pipe(Effect.timeout(PROVIDER_NAME_TIMEOUT), Effect.option),
       providers: client.provider
         .list({ location })
         .pipe(Effect.timeout(PROVIDER_NAME_TIMEOUT), Effect.option),
     },
     { concurrency: "unbounded" },
   ).pipe(
-    Effect.map(({ models, providers }) => {
+    Effect.map(({ models, providers, agents }) => {
+      const listedAgents = Option.getOrUndefined(agents)?.data.map(
+        ({ id, name, mode, hidden }) => ({ id, name, mode, hidden }),
+      );
       const providerNames = new Map(
         (Option.getOrUndefined(providers)?.data ?? []).map((provider) => [
           provider.id,
@@ -38,6 +44,7 @@ export const loadOpenCode2Catalog = (
           name: model.name,
           ...(providerName ? { providerName } : {}),
           variants: model.variants.map((variant) => ({ id: variant.id })),
+          ...(listedAgents === undefined ? {} : { agents: listedAgents }),
           family: model.family,
           released: model.time.released,
           deprecated: model.status === "deprecated",

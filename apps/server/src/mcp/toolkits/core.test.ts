@@ -356,6 +356,56 @@ it.effect("records only failed calls of tools that hand off no work", () => {
   );
 });
 
+it.effect("snoozes only the calling thread and rejects target or action injection", () => {
+  const dispatched: Array<unknown> = [];
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const call = (args: Record<string, unknown>) =>
+      server
+        .callTool({ name: "t3_thread_snooze", arguments: args })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+    const snoozedUntil = "2027-01-01T00:00:00.000Z";
+    expect((yield* call({ snoozedUntil })).isError).not.toBe(true);
+    expect(dispatched).toMatchObject([{ type: "thread.snooze", threadId, snoozedUntil }]);
+    for (const extra of [
+      { threadId: "other-thread" },
+      { action: "archive" },
+      { environmentId: "other-environment" },
+    ]) {
+      const result = yield* call({ snoozedUntil, ...extra }).pipe(Effect.result);
+      expect(result).toMatchObject({
+        _tag: "Failure",
+        failure: { message: expect.stringContaining("Expected no excess property") },
+      });
+    }
+    expect(dispatched).toHaveLength(1);
+  }).pipe(
+    Effect.provide(
+      layerThreadToolkit.pipe(
+        Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
+            getProjectThreadRecords: ({ threadId: id }) =>
+              Effect.succeed(
+                McpToolAccessTestkit.idleThreadProjection(McpToolAccessTestkit.liveThreadShell(id)),
+              ),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: 1, storedEvents: [] };
+              }),
+          }),
+        ),
+      ),
+    ),
+  );
+});
+
 it.effect("rejects an unknown organize target instead of archiving the calling thread", () => {
   const dispatched: Array<unknown> = [];
   return Effect.gen(function* () {

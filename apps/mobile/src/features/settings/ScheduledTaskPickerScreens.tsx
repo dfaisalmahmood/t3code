@@ -10,6 +10,7 @@ import { useDebouncedValue, usePaginatedBranches } from "../../state/queries";
 import { BranchPickerScreen } from "../threads/NewTaskContextPickerScreens";
 import { ThreadSettingsPickerScreen } from "../threads/ThreadSettingsSheet";
 import { SettingsScreen } from "./components/SettingsScreen";
+import { scheduledTaskCatalogCwd, scheduledTaskModelConfig } from "./scheduledTaskDraft";
 import { useScheduledTaskEditor } from "./scheduled-task-editor";
 
 function MissingTaskDraft() {
@@ -23,7 +24,15 @@ function MissingTaskDraft() {
 export function ScheduledTaskModelPickerRouteScreen() {
   const navigation = useNavigation();
   const { editor, setEditor } = useScheduledTaskEditor();
-  const config = useEnvironmentServerConfig(editor?.environmentId ?? null);
+  const machineConfig = useEnvironmentServerConfig(editor?.environmentId ?? null);
+  const projects = useProjects();
+  const project =
+    projects.find(
+      (project) =>
+        project.environmentId === editor?.environmentId && project.id === editor?.draft.projectId,
+    ) ?? null;
+  const cwd = scheduledTaskCatalogCwd(project, editor?.draft);
+  const config = scheduledTaskModelConfig(machineConfig, project, editor?.draft);
   const selectedModel = editor?.draft.modelSelection ?? null;
   const projectId = editor?.draft.projectId ?? null;
   const models = useMemo(
@@ -51,6 +60,7 @@ export function ScheduledTaskModelPickerRouteScreen() {
     <ThreadSettingsPickerScreen
       environmentId={editor.environmentId}
       projectId={projectId}
+      cwd={cwd}
       providerGroups={providerGroups}
       selectedModel={selectedModel}
       prompt={editor.draft.prompt}

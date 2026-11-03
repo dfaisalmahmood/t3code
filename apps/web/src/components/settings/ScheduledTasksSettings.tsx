@@ -91,6 +91,7 @@ import {
   matchesScheduledTaskScope,
   scheduleFromDraft,
   scheduledTaskDefaultModel,
+  scheduledTaskProviders,
   taskToDraft,
   type DraftState,
   type ScheduleMode,
@@ -1205,7 +1206,7 @@ function ScheduledTaskEditorForm({
     );
   const scopedProjects = projectsOn(environmentId);
   const settings = useEnvironmentSettings(environmentId);
-  const providers =
+  const machineProviders =
     useAtomValue(serverEnvironment.providersValueAtom(environmentId)) ?? EMPTY_SERVER_PROVIDERS;
   const canOperate = useAtomValue(
     serverEnvironment.upsertScheduledTask.permissionAtom(environmentId),
@@ -1241,6 +1242,11 @@ function ScheduledTaskEditorForm({
     : task;
   const selectedProjectId = draft.projectId || projects[0]?.id || "";
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
+  const providers = scheduledTaskProviders(machineProviders, selectedProject, draft);
+  const catalogCwd =
+    draft.workspaceMode === "existing_worktree"
+      ? draft.existingWorktreePath.trim() || selectedProject?.workspaceRoot
+      : selectedProject?.workspaceRoot;
   const instanceEntries = providerInstanceEntriesFor(
     providers,
     settings,
@@ -1253,7 +1259,7 @@ function ScheduledTaskEditorForm({
     draftSelection &&
     instanceEntries.some((entry) => entry.instanceId === draftSelection.instanceId && entry.enabled)
       ? draftSelection
-      : scheduledTaskDefaultModel(settings, selectedProject ?? null, instanceEntries);
+      : scheduledTaskDefaultModel(settings, selectedProject ?? null, instanceEntries, catalogCwd);
   const activeInstanceId =
     activeSelection?.instanceId ?? firstInstance?.instanceId ?? ("" as ProviderInstanceId);
   const activeModel = activeSelection?.model ?? "";

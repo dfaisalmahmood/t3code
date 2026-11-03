@@ -53,6 +53,31 @@ const readCatalog = (
   );
 
 describe("loadOpenCode2Catalog", () => {
+  it.effect("keeps named primary agent metadata with the model catalog", () =>
+    Effect.gen(function* () {
+      const models = yield* readCatalog({
+        "/api/model": MODELS_BODY,
+        "/api/provider": PROVIDERS_BODY,
+        "/api/agent": JSON.stringify({
+          location: { directory: "/project" },
+          data: [
+            {
+              id: "mason",
+              name: "Mason",
+              mode: "primary",
+              hidden: false,
+              request: { settings: {}, headers: {}, body: {} },
+              permissions: [],
+            },
+          ],
+        }),
+      });
+      assert.deepStrictEqual(models[0]?.agents, [
+        { id: "mason", name: "Mason", mode: "primary", hidden: false },
+      ]);
+    }),
+  );
+
   it.effect("names the provider each listed model came from", () =>
     Effect.gen(function* () {
       const models = yield* readCatalog({
@@ -60,6 +85,7 @@ describe("loadOpenCode2Catalog", () => {
         "/api/provider": PROVIDERS_BODY,
       });
 
+      assert.strictEqual(models[0]?.agents, undefined);
       assert.deepStrictEqual(
         models.map((model) => [`${model.providerID}/${model.id}`, model.providerName]),
         [

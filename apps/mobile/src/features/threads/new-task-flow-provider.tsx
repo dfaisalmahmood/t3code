@@ -447,6 +447,8 @@ export function NewTaskFlowProvider(
     draftModelSelection ?? projectDefaultModelSelection ?? stickyModelSelection,
     undefined,
     selectedProject?.id ?? null,
+    false,
+    workspaceSelection?.worktreePath ?? selectedProject?.workspaceRoot,
   );
 
   const selectedDefaultModel = resolveNewTaskModelSelection({

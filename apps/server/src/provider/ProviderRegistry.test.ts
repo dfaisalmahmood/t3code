@@ -627,6 +627,7 @@ it.layer(
       } satisfies ServerProvider;
       const scopedSnapshot = {
         ...provider,
+        models: [{ slug: "project/model", name: "Project", isCustom: false, capabilities: null }],
         checkedAt: "2026-03-25T00:01:00.000Z",
         slashCommands: [{ name: "project" }],
         skills: [{ name: "project", path: "/project/SKILL.md", enabled: true }],
@@ -653,12 +654,37 @@ it.layer(
       assert.deepStrictEqual(decoded.workspaceSnapshots, [
         {
           cwd: "/project",
+          models: scopedSnapshot.models,
           checkedAt: scopedSnapshot.checkedAt,
           slashCommands: scopedSnapshot.slashCommands,
           skills: scopedSnapshot.skills,
           optionDescriptors: scopedSnapshot.optionDescriptors,
         },
       ]);
+
+      const emptyScoped = ProviderRegistry.upsertProviderWorkspaceSnapshot(result, "/empty", {
+        ...scopedSnapshot,
+        models: [],
+      });
+      const roundtrip = decodeServerProvider(encodeServerProvider(emptyScoped));
+      assert.deepStrictEqual(
+        roundtrip.workspaceSnapshots?.find((snapshot) => snapshot.cwd === "/empty")?.models,
+        [],
+      );
+      const legacy = decodeServerProvider(
+        encodeServerProvider({
+          ...provider,
+          workspaceSnapshots: [
+            {
+              cwd: "/legacy",
+              checkedAt: provider.checkedAt,
+              skills: [],
+              slashCommands: [],
+            },
+          ],
+        }),
+      );
+      assert.strictEqual(Object.hasOwn(legacy.workspaceSnapshots![0]!, "models"), false);
 
       const pendingSnapshot = {
         ...scopedSnapshot,

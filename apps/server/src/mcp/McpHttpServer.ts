@@ -1159,6 +1159,14 @@ export const layerDeviceToolkit = Layer.mergeAll(
   layerDeviceScreenshotRegistration,
 );
 
+export const layerToolCatalog = Layer.effect(
+  McpSessionRegistry.McpToolCatalog,
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    return { names: Effect.sync(() => server.tools.map(({ tool }) => tool.name)) };
+  }),
+).pipe(Layer.provide(McpServer.McpServer.layer));
+
 /**
  * `McpServer` for in-process calls, which provide `McpInvocationContext`
  * around `callTool` as the auth middleware does for each /mcp request.

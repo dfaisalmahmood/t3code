@@ -1,3 +1,4 @@
+import { resolveProviderForCwd } from "@t3tools/shared/model";
 import {
   DEFAULT_MODEL_BY_PROVIDER,
   ProjectId,
@@ -589,5 +590,70 @@ describe("provider icon metadata", () => {
     expect(restoredEntry?.acpRegistryAgentId).toBe("swe-agent");
     expect(restoredEntry?.acpRegistryIconUrl).toBe(iconUrl);
     expect(restoredEntry?.enabled).toBe(true);
+  });
+});
+
+describe("workspace model catalogs", () => {
+  it("offers only the matching cwd models and agents, preserving legacy fallback", () => {
+    const scopedModel = (agent: string) => ({
+      ...model("project/model"),
+      capabilities: {
+        optionDescriptors: [
+          {
+            id: "agent",
+            label: "Agent",
+            type: "select" as const,
+            options: [{ id: agent, label: agent }],
+          },
+        ],
+      },
+    });
+    const host = provider({
+      provider: ProviderDriverKind.make("opencode2"),
+      instanceId: "work",
+      models: [],
+    });
+    const snapshot = (cwd: string, models?: ServerProvider["models"]) => ({
+      cwd,
+      checkedAt: host.checkedAt,
+      slashCommands: [],
+      skills: [],
+      ...(models === undefined ? {} : { models }),
+    });
+    const scoped = {
+      ...host,
+      workspaceSnapshots: [
+        snapshot("/a", [scopedModel("alpha")]),
+        snapshot("/b", [scopedModel("beta")]),
+        snapshot("/empty", []),
+        snapshot("/legacy"),
+      ],
+    };
+    for (const [cwd, expected] of [
+      ["/a", "alpha"],
+      ["/b", "beta"],
+    ] as const) {
+      const entry = deriveProviderInstanceEntries([resolveProviderForCwd(scoped, cwd)])[0];
+      expect(entry?.models).toEqual([scopedModel(expected)]);
+    }
+    const withHost = { ...scoped, models: [scopedModel("host")] };
+    expect(
+      deriveProviderInstanceEntries([resolveProviderForCwd(withHost, "/empty")])[0]?.models,
+    ).toEqual([]);
+    for (const cwd of ["/legacy", "/missing", null]) {
+      expect(
+        deriveProviderInstanceEntries([resolveProviderForCwd(withHost, cwd)])[0]?.models,
+      ).toEqual(withHost.models);
+    }
+    const other = {
+      ...host,
+      instanceId: ProviderInstanceId.make("other"),
+      models: [scopedModel("other")],
+    };
+    expect(
+      deriveProviderInstanceEntries(
+        [scoped, other].map((provider) => resolveProviderForCwd(provider, "/a")),
+      )[1]?.models,
+    ).toEqual(other.models);
   });
 });

@@ -7,6 +7,7 @@ import {
   ScheduledTaskId,
   type ScheduledTask,
 } from "@t3tools/contracts";
+import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type {
@@ -15,8 +16,10 @@ import type {
 } from "../../sidebarProjectGrouping";
 import { resolveSettingsScope, type SettingsScopeSearch } from "./settingsScope";
 
+import { getCustomModelOptionsByInstance } from "../../modelSelection";
 import { deriveProviderInstanceEntries } from "../../providerInstances";
 import {
+  scheduledTaskProviders,
   scheduledTaskDefaultModel,
   defaultScheduledTaskProjectId,
   matchesScheduledTaskScope,
@@ -357,6 +360,89 @@ describe("scheduled task model defaults", () => {
       project,
       deriveProviderInstanceEntries(value.providers),
     );
+
+  it("uses the scheduled workspace catalog for defaults and agent options across project switches", () => {
+    const model = (slug: string, agent: string) => ({
+      slug,
+      name: slug,
+      isCustom: false,
+      isDefault: true,
+      capabilities: {
+        optionDescriptors: [
+          {
+            id: "agent",
+            label: "Agent",
+            type: "select" as const,
+            options: [{ id: agent, label: agent }],
+          },
+        ],
+      },
+    });
+    for (const hostModels of [[], [model("host", "host-agent")]]) {
+      const scoped = {
+        ...config,
+        settings: { ...config.settings, defaultModelSelection: { instanceId, model: "host" } },
+        providers: config.providers.map((provider) => ({
+          ...provider,
+          models: hostModels,
+          workspaceSnapshots: ["/a", "/b", "/checkout", "/empty", "/legacy"].map((cwd) => ({
+            cwd,
+            checkedAt: "2026-01-01T00:00:00.000Z",
+            slashCommands: [],
+            skills: [],
+            ...(cwd === "/legacy"
+              ? {}
+              : { models: cwd === "/empty" ? [] : [model(cwd, `${cwd}-agent`)] }),
+          })),
+        })),
+      };
+      for (const [root, workspace, path, want] of [
+        ["/a", "worktree", "", "/a"],
+        ["/b", "root", "", "/b"],
+        ["/a", "existing_worktree", " /checkout ", "/checkout"],
+        ["/empty", "worktree", "", null],
+        ["/legacy", "root", "", hostModels.length ? "host" : null],
+        ["/missing", "root", "", hostModels.length ? "host" : null],
+      ] as const) {
+        const project = { id: projectId, workspaceRoot: root };
+        const providers = scheduledTaskProviders(scoped.providers, project, {
+          workspaceMode: workspace,
+          existingWorktreePath: path,
+        });
+        const entries = deriveProviderInstanceEntries(providers);
+        expect(
+          scheduledTaskDefaultModel(
+            scoped.settings,
+            project,
+            entries,
+            workspace === "existing_worktree" ? path.trim() : root,
+          ),
+        ).toEqual(
+          root === "/legacy" || root === "/missing"
+            ? { instanceId, model: "host" }
+            : want
+              ? { instanceId, model: want }
+              : null,
+        );
+        expect(entries.flatMap((entry) => entry.models.map((model) => model.slug))).toEqual(
+          want ? [want] : [],
+        );
+        const options = getCustomModelOptionsByInstance(
+          { ...DEFAULT_UNIFIED_SETTINGS, providerInstances: scoped.settings.providerInstances },
+          providers,
+          instanceId,
+          want ?? "",
+        );
+        if (want)
+          expect(providers[0]?.models[0]?.capabilities?.optionDescriptors).toMatchObject([
+            { id: "agent", options: [{ id: `${want}-agent` }] },
+          ]);
+        expect(options.get(instanceId)?.map((model) => model.slug)).toEqual(want ? [want] : []);
+        expect(scoped.providers[0]?.models).toEqual(hostModels);
+        expect(providers?.[0]?.status).toBe("ready");
+      }
+    }
+  });
   it("uses the advertised default instead of catalog order when no default is configured", () => {
     expect(
       resolve({ ...config, settings: { ...config.settings, defaultModelSelection: null } }, null),

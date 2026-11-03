@@ -13,6 +13,7 @@ import { DeviceService } from "../device/DeviceService.ts";
 import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
 import { GitWorkflowService } from "../git/GitWorkflowService.ts";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
+import { McpToolCatalog } from "../mcp/McpSessionRegistry.ts";
 import { PreviewAutomationBroker } from "../mcp/PreviewAutomationBroker.ts";
 import {
   CLAUDE_PROVIDER,
@@ -111,6 +112,9 @@ const codexAdditionalContext = () =>
 it.effect("agent context matches the committed budget", () =>
   Effect.gen(function* () {
     const mcp = yield* McpServer.McpServer;
+    const catalog = yield* McpToolCatalog;
+    expect(yield* catalog.names).toEqual(mcp.tools.map(({ tool }) => tool.name));
+    expect(yield* catalog.names).toContain("t3_thread_snooze");
     const measured = {
       claudeSystemAppendBytes: utf8Bytes(claudeSystemAppend()),
       codexAdditionalContextBytes: utf8Bytes(codexAdditionalContext()),
@@ -133,6 +137,7 @@ it.effect("agent context matches the committed budget", () =>
   }).pipe(
     Effect.provide(
       McpHttpServer.layerTools.pipe(
+        Layer.provideMerge(McpHttpServer.layerToolCatalog),
         Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
         Layer.provide(toolHandlerServices),
       ),
