@@ -63,15 +63,38 @@ export function useScheduledTaskEditor() {
   );
   const session = useAtomValue(scheduledTaskEditorSessionAtom);
   const voiceOwnerKey = `scheduled-task:${session?.id ?? 0}`;
-  const editor = session ? session.current : defaultEditor;
+  const storedEditor = session ? session.current : defaultEditor;
+  const resolveEditor = (current: ScheduledTaskEditor | null): ScheduledTaskEditor | null => {
+    if (!current || current.draft.modelSelectionIsExplicit) return current;
+    const project =
+      projects.find(
+        (project) =>
+          project.environmentId === current.environmentId && project.id === current.draft.projectId,
+      ) ?? null;
+    return {
+      ...current,
+      draft: {
+        ...current.draft,
+        modelSelection: scheduledTaskDefaultModel(
+          configs.get(current.environmentId) ?? null,
+          project,
+          current.draft,
+        ),
+      },
+    };
+  };
+  const editor = resolveEditor(storedEditor);
   const initial = session ? session.initial : defaultEditor;
-  const hasChanges = scheduledTaskEditorHasChanges(initial, editor);
+  const hasChanges = scheduledTaskEditorHasChanges(initial, storedEditor);
   const setEditor: Dispatch<SetStateAction<ScheduledTaskEditor | null>> = (update) => {
-    updateScheduledTaskEditor(update, defaultEditor);
+    updateScheduledTaskEditor(
+      typeof update === "function" ? (current) => update(resolveEditor(current)) : update,
+      defaultEditor,
+    );
   };
   const startEditor = startScheduledTaskEditor;
   const resetEditor = () => startEditor(defaultEditor);
-  const readEditor = () => readScheduledTaskEditor(voiceOwnerKey, defaultEditor);
+  const readEditor = () => resolveEditor(readScheduledTaskEditor(voiceOwnerKey, defaultEditor));
   return {
     editor,
     voiceOwnerKey,
