@@ -13,8 +13,10 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as References from "effect/References";
 import * as Stream from "effect/Stream";
+import * as UrlParams from "effect/http/UrlParams";
 import * as TestClock from "effect/testing/TestClock";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientResponse from "effect/http/HttpClientResponse";
@@ -230,6 +232,143 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
         yield* TestClock.adjust("15 minutes");
         assert.strictEqual(modelReads, readsAfterRecovery);
         assert.strictEqual(discoveryLogs.length, 1);
+      }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect.each([true, false])(
+    "isolates cwd model and agent discovery when host inventory is empty: %s",
+    (emptyHost) =>
+      Effect.gen(function* () {
+        const unavailable = new Set<string>();
+        const reads: Array<[string, string | undefined]> = [];
+        const replay = replayOpenCodeServer(OPENCODE_2_RESPONSES, "secret");
+        const server = HttpClient.make((request) => {
+          const path = new URL(request.url).pathname;
+          const cwd = Option.getOrUndefined(
+            UrlParams.getFirst(request.urlParams, "location[directory]"),
+          );
+          if (
+            !["/api/model", "/api/agent", "/api/provider", "/api/command", "/api/skill"].includes(
+              path,
+            )
+          ) {
+            return replay.execute(request);
+          }
+          reads.push([path, cwd]);
+          const id = cwd === "/project-a" ? "alpha" : cwd === "/project-b" ? "beta" : "host";
+          if (unavailable.has(cwd ?? "") && path === "/api/model") return Effect.never;
+          const empty = emptyHost && id === "host";
+          const model = {
+            id,
+            modelID: id,
+            providerID: "opencode",
+            name: id,
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: {},
+            compatibility: {},
+            capabilities: { tools: true, input: ["text"], output: ["text"] },
+            variants: [{ id: id === "alpha" ? "high" : "low", settings: {} }],
+            time: { released: 1789516800000 },
+            cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+            status: "active",
+            enabled: true,
+            limit: { context: 1000000, output: 65536 },
+          };
+          const data =
+            path === "/api/model"
+              ? empty
+                ? []
+                : [model]
+              : path === "/api/agent"
+                ? [
+                    {
+                      id,
+                      name: id,
+                      mode: "primary",
+                      hidden: false,
+                      request: { settings: {}, headers: {}, body: {} },
+                      permissions: [],
+                    },
+                  ]
+                : path === "/api/command"
+                  ? [{ name: "init" }]
+                  : [];
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              Response.json({ location: { directory: cwd }, data }),
+            ),
+          );
+        });
+        const instance = yield* create(
+          { serverUrl: "http://127.0.0.1:4096", serverPassword: "secret" },
+          server,
+        );
+        const machine = yield* instance.snapshot.streamChanges.pipe(
+          Stream.filter((snapshot) => snapshot.installed && snapshot.version !== null),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* TestClock.adjust("5 seconds");
+        yield* Fiber.join(machine);
+        const read = Effect.fn("test.readCwd")(function* (cwd: string) {
+          const scan = instance.snapshotForCwd;
+          if (!scan) return yield* Effect.die("Missing workspace discovery");
+          const pending = yield* scan(cwd).pipe(Effect.forkChild);
+          yield* TestClock.adjust("5 seconds");
+          return yield* Fiber.join(pending);
+        });
+        const alpha = yield* read("/project-a");
+        assert.deepStrictEqual(
+          alpha.models.map((model) => model.slug),
+          ["opencode/alpha"],
+        );
+        const beta = yield* read("/project-b");
+        assert.deepStrictEqual(
+          beta.models.map((model) => model.slug),
+          ["opencode/beta"],
+        );
+        for (const [snapshot, agent, variant] of [
+          [alpha, "alpha", "high"],
+          [beta, "beta", "low"],
+        ] as const) {
+          const descriptors = snapshot.models[0]?.capabilities?.optionDescriptors?.filter(
+            (option) => option.type === "select",
+          );
+          assert.deepStrictEqual(
+            descriptors
+              ?.find((option) => option.id === "agent")
+              ?.options?.map((option) => option.id),
+            [agent],
+          );
+          assert.deepStrictEqual(
+            descriptors
+              ?.find((option) => option.id === "variant")
+              ?.options?.map((option) => option.id),
+            [variant],
+          );
+        }
+        unavailable.add("/project-c");
+        assert.deepStrictEqual((yield* read("/project-c")).models, []);
+        unavailable.add("/project-a");
+        const staleAlpha = yield* read("/project-a");
+        assert.deepStrictEqual(staleAlpha.models, alpha.models);
+        for (const cwd of ["/project-a", "/project-b", "/project-c"]) {
+          assert.isTrue(
+            reads.some(([path, directory]) => path === "/api/model" && directory === cwd),
+          );
+          assert.isTrue(
+            reads.some(([path, directory]) => path === "/api/agent" && directory === cwd),
+          );
+        }
+        const health = yield* instance.snapshot.getSnapshot;
+        assert.strictEqual(health.status, emptyHost ? "warning" : "ready");
+        assert.strictEqual(alpha.status, health.status);
+        assert.deepStrictEqual(
+          health.models.map((model) => model.slug),
+          emptyHost ? [] : ["opencode/host"],
+        );
       }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
 
