@@ -2059,6 +2059,36 @@ describe("storage cleanup reports and local file policies", () => {
     ),
   );
   it.live.each([
+    ["fatal: not a git repository: /missing-git-directory", "kept"],
+    ["fatal: gitfile does not point to a valid repository: /worktree/.git", "kept"],
+    ["fatal: detected dubious ownership in repository at /worktree", "failed"],
+    ["fatal: unable to read gitfile: Permission denied", "failed"],
+  ] as const)("retains the worktree after branch read diagnostic %s", ([stderr, outcome]) =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const git = yield* GitVcsDriver.GitVcsDriver;
+        const { service, fs, worktree, fullStatusCalls } = yield* cleanupFixture().pipe(
+          Effect.provideService(GitVcsDriver.GitVcsDriver, {
+            ...git,
+            execute: (input) =>
+              input.operation === "StorageCleanup.branchChanged"
+                ? Effect.succeed({ stdout: "", stderr, exitCode: 128 })
+                : git.execute(input),
+          }),
+        );
+        const report = yield* service.runNow;
+        expect(report.entries[0]).toMatchObject({
+          outcome,
+          reason: outcome === "kept" ? "Repository or branch changed" : `git: ${stderr}`,
+          bytes: null,
+        });
+        expect(report.bytesFreed).toBe(0);
+        expect(yield* fs.readFileString(`${worktree}/tracked.txt`)).toBe("original\n");
+        expect(fullStatusCalls()).toBe(0);
+      }),
+    ),
+  );
+  it.live.each([
     ["any-local-files", ".env", "kept"],
     ["uncommitted-changes", ".env", "removed"],
     ["tracked-changes", ".env", "removed"],

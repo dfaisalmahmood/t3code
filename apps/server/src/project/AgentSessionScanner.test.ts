@@ -17,6 +17,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -28,6 +29,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 
@@ -58,8 +60,8 @@ interface ScannerTestInput {
   readonly providerInstances?: ContractServerSettings["providerInstances"];
 }
 
-const layerScannerTest = (input: ScannerTestInput) =>
-  AgentSessionScanner.layer.pipe(
+const layerScannerTest = (input: ScannerTestInput, scannerLayer = AgentSessionScanner.layer) =>
+  scannerLayer.pipe(
     Layer.provide(
       Layer.mergeAll(
         ServerSettings.layerTest({
@@ -98,11 +100,11 @@ const layerScannerTest = (input: ScannerTestInput) =>
     ),
   );
 
-const runScan = (input: ScannerTestInput) =>
+const runScan = (input: ScannerTestInput, scannerLayer = AgentSessionScanner.layer) =>
   Effect.gen(function* () {
     const scanner = yield* AgentSessionScanner.AgentSessionScanner;
     return yield* scanner.scan;
-  }).pipe(Effect.provide(layerScannerTest(input)));
+  }).pipe(Effect.provide(layerScannerTest(input, scannerLayer)));
 
 const runRecentThreadOutcomes = (input: ScannerTestInput & { readonly workspaceRoot: string }) =>
   Effect.gen(function* () {
@@ -1959,11 +1961,42 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
           });
         }
 
+        const processRunner = yield* ProcessRunner.make();
         for (let attempt = 1; attempt <= 2; attempt++) {
-          const scan = yield* Effect.forkChild(runScan({ claudeHomePath, codexHomePath }));
+          const normalReads = yield* Effect.forEach([repos[0], repos[2]], (repo) =>
+            Effect.map(Deferred.make<void>(), (completed) => ({
+              configPath: path.join(repo, ".git", "config"),
+              completed,
+            })),
+          );
+          const scannerLayer = Layer.effect(
+            AgentSessionScanner.AgentSessionScanner,
+            AgentSessionScanner.make,
+          ).pipe(
+            Layer.provide(
+              Layer.succeed(ProcessRunner.ProcessRunner, {
+                run: (input) =>
+                  processRunner
+                    .run(input)
+                    .pipe(
+                      Effect.tap(() =>
+                        Effect.forEach(normalReads, ({ configPath, completed }) =>
+                          input.command === "cat" && input.args[1] === configPath
+                            ? Deferred.succeed(completed, undefined)
+                            : Effect.void,
+                        ),
+                      ),
+                    ),
+              }),
+            ),
+          );
+          const scan = yield* Effect.forkChild(
+            runScan({ claudeHomePath, codexHomePath }, scannerLayer),
+          );
           const result = yield* Effect.scoped(
             Effect.gen(function* () {
               yield* awaitGateReader(path.join(repos[1], ".git", "config"));
+              yield* Effect.forEach(normalReads, ({ completed }) => Deferred.await(completed));
               yield* TestClock.adjust("2 seconds");
               return yield* Fiber.join(scan);
             }),
