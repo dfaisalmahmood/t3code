@@ -53,6 +53,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
+import { compileAgentPermissions, permissionEffect } from "./agentPermissions.ts";
 import * as OpenCode2Client from "./OpenCode2Client.ts";
 import * as OpenCode2Server from "./OpenCode2Server.ts";
 import * as OpenCodeRuntime from "../OpenCodeRuntime.ts";
@@ -282,6 +283,7 @@ interface ThreadState {
   unsettledStarted: boolean;
   directory: string;
   agent: string;
+  restrictedAgent: string | undefined;
   title: string | undefined;
   rules: ReadonlyArray<Rule> | undefined;
   policy: RulesPolicy;
@@ -611,8 +613,9 @@ const sameModel = (left: ModelRef, right: ModelRef | undefined) =>
   left.id === right?.id &&
   (left.variant ?? "default") === (right?.variant ?? "default");
 
-const agentFor = (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
-  input.runtimePolicy.interactionMode === "plan" ? "plan" : "build";
+const agentFor = (selection: ModelSelection, policy: RulesPolicy) =>
+  getModelSelectionStringOptionValue(selection, "agent") ??
+  (policy.interactionMode === "plan" ? "plan" : "build");
 
 const commandOf = (text: string) => {
   const match = /^\/([^\s/]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
@@ -744,6 +747,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       unsettledStarted: false,
       directory,
       agent: "build",
+      restrictedAgent: undefined,
       title: undefined,
       rules: undefined,
       policy: input.runtimePolicy,
@@ -1255,12 +1259,19 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     const withReportedModel = (
       providerThread: OrchestrationV2ProviderThread,
       model: ModelRef | undefined,
+      agent: string | null = getModelSelectionStringOptionValue(
+        providerThread.nativeMetadata?.modelSelection,
+        "agent",
+      ) ?? null,
     ): OrchestrationV2ProviderThread => {
       if (model === undefined) return providerThread;
       const modelSelection: ModelSelection = {
         instanceId,
         model: `${model.providerID}/${model.id}`,
-        options: model.variant === undefined ? [] : [{ id: "variant", value: model.variant }],
+        options: [
+          ...(model.variant === undefined ? [] : [{ id: "variant", value: model.variant }]),
+          ...(agent === null ? [] : [{ id: "agent", value: agent }]),
+        ],
       };
       if (
         providerThread.nativeMetadata?.modelSelection !== undefined &&
@@ -2757,10 +2768,33 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     });
 
     const rulesFor = Effect.fnUntraced(function* (
-      thread: Pick<ThreadState, "directory" | "agent" | "grants">,
+      thread: Pick<ThreadState, "directory" | "agent" | "restrictedAgent" | "grants">,
       policy: RulesPolicy,
-      appThreadId: string | null,
+      appThreadId: OrchestrationV2ProviderThread["appThreadId"],
     ) {
+      const mcpServerName = appThreadId === null ? null : yield* mcpServerNameFor(appThreadId);
+      if (thread.restrictedAgent !== undefined) {
+        const listed = yield* client.agent
+          .list({ location: { directory: thread.directory } })
+          .pipe(Effect.timeout("5 seconds"));
+        const profile = listed.data.find(
+          (agent) =>
+            agent.id === thread.restrictedAgent && !agent.hidden && agent.mode !== "subagent",
+        );
+        if (profile === undefined) {
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver,
+            detail: `Selected OpenCode primary agent '${thread.restrictedAgent}' is unavailable`,
+          });
+        }
+        const mcp = appThreadId === null ? undefined : yield* mcpSessions.read(appThreadId);
+        return compileAgentPermissions({
+          profile: profile.permissions,
+          ...policy,
+          mcpServerName,
+          mcpToolNames: mcp?.toolNames ?? [],
+        });
+      }
       const plan = policy.interactionMode === "plan";
       const paths =
         policy.runtimeMode === "full-access" && !plan
@@ -2770,12 +2804,25 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         policy,
         paths,
         policy.runtimeMode === "full-access" ? [] : thread.grants,
-        appThreadId === null ? null : yield* mcpServerNameFor(appThreadId),
+        mcpServerName,
       );
     });
 
-    const writeRules = Effect.fnUntraced(function* (state: ThreadState, policy: RulesPolicy) {
-      const rules = yield* rulesFor(state, policy, rootOf(state).providerThread.appThreadId);
+    const writeRules = Effect.fnUntraced(function* (
+      state: ThreadState,
+      policy: RulesPolicy,
+      selection?: ModelSelection,
+    ) {
+      const restrictedAgent =
+        selection === undefined
+          ? state.restrictedAgent
+          : getModelSelectionStringOptionValue(selection, "agent");
+      const agent = selection === undefined ? state.agent : agentFor(selection, policy);
+      const rules = yield* rulesFor(
+        { ...state, agent, restrictedAgent },
+        policy,
+        rootOf(state).providerThread.appThreadId,
+      );
       if (!sameRules(state.rules, rules)) {
         yield* client.session.update({
           sessionID: Session.ID.make(state.sessionId),
@@ -2783,6 +2830,19 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         });
         state.rules = rules;
       }
+      if (agent !== state.agent) {
+        yield* client.session.switchAgent({
+          sessionID: Session.ID.make(state.sessionId),
+          agent: Agent.ID.make(agent),
+        });
+        state.agent = agent;
+      }
+      state.restrictedAgent = restrictedAgent;
+      state.providerThread = withReportedModel(
+        state.providerThread,
+        state.model,
+        restrictedAgent ?? null,
+      );
       state.policy = policy;
     });
 
@@ -3383,7 +3443,15 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const directory = threadInput.runtimePolicy.cwd ?? host.paths.cwd;
           const policy = threadInput.runtimePolicy;
           const permissions = yield* rulesFor(
-            { directory, agent: "build", grants: [] },
+            {
+              directory,
+              agent: agentFor(threadInput.modelSelection, policy),
+              restrictedAgent: getModelSelectionStringOptionValue(
+                threadInput.modelSelection,
+                "agent",
+              ),
+              grants: [],
+            },
             policy,
             threadInput.threadId,
           );
@@ -3392,6 +3460,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const created = yield* client.session.create({
             location: Location.PublicRef.make({ directory: AbsolutePath.make(directory) }),
             model,
+            ...(getModelSelectionStringOptionValue(threadInput.modelSelection, "agent") ===
+            undefined
+              ? {}
+              : {
+                  agent: Agent.ID.make(agentFor(threadInput.modelSelection, policy)),
+                }),
             permissions,
             ...(title === undefined ? {} : { title }),
           });
@@ -3427,6 +3501,15 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             directory,
           );
           state.policy = policy;
+          state.restrictedAgent = getModelSelectionStringOptionValue(
+            threadInput.modelSelection,
+            "agent",
+          );
+          state.providerThread = withReportedModel(
+            state.providerThread,
+            state.model,
+            state.restrictedAgent,
+          );
           return state.providerThread;
         },
         (effect, threadInput) =>
@@ -3459,7 +3542,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const loaded = threads.has(sessionId);
           const state = register(providerThread, native, cwd ?? native.location.directory);
           if (!loaded) yield* stopLeftoverRequests(state);
-          yield* writeRules(state, threadInput.runtimePolicy ?? state.policy);
+          yield* writeRules(
+            state,
+            threadInput.runtimePolicy ?? state.policy,
+            threadInput.modelSelection ?? threadInput.providerThread.nativeMetadata?.modelSelection,
+          );
           if (cwd != null && native.location.directory !== cwd) {
             yield* client.session.move({
               sessionID: Session.ID.make(sessionId),
@@ -3516,7 +3603,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                   reason: "previous_turn_active",
                 });
               }
-              if (isContinuation(turnInput)) return yield* runWake(state, turnInput);
+              if (isContinuation(turnInput)) {
+                if (state.restrictedAgent !== undefined)
+                  yield* writeRules(state, turnInput.runtimePolicy, turnInput.modelSelection);
+                return yield* runWake(state, turnInput);
+              }
               const afterUnsettled = state.unsettled;
               let stillStopping = false;
               if (state.unsettled) {
@@ -3554,17 +3645,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                   }),
                 });
               }
-              // Switch to the plan agent before writing rules to retain its own path allows.
-              const agent = agentFor(turnInput);
-              if (agent !== state.agent) {
-                yield* client.session.switchAgent({
-                  sessionID: Session.ID.make(sessionId),
-                  agent: Agent.ID.make(agent),
-                });
-                state.agent = agent;
-              }
-              // Refresh stale mode rules; running subagent updates are best effort because they outlive this turn.
-              yield* writeRules(state, turnInput.runtimePolicy);
+              yield* writeRules(state, turnInput.runtimePolicy, turnInput.modelSelection);
               yield* writeTitle(state, turnInput.appThread.title).pipe(
                 Effect.timeout(REQUEST_REPLY_TIMEOUT),
                 Effect.ignore({ log: true }),
@@ -3653,6 +3734,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               detail: `OpenCode turn ${steerInput.providerTurnId} is not active`,
             });
           }
+          if (state.restrictedAgent !== undefined) yield* writeRules(state, state.policy);
           const inboxID = steerPromptId(sessionId, steerInput.message.messageId);
           if (turn.settledInbox.has(inboxID)) return;
           turn.steers.add(inboxID);
@@ -3823,11 +3905,19 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               detail: `OpenCode approval request ${requestInput.requestId} requires a decision`,
             });
           }
-          entry.answering = true;
           // Native always grants persist in the asking subagent's project, not its parent's.
           const asker = threads.get(entry.sessionId) ?? entry.state;
+          if (asker.restrictedAgent !== undefined) yield* writeRules(asker, asker.policy);
+          const denied =
+            native.type === "permission" &&
+            asker.restrictedAgent !== undefined &&
+            (native.resources.length === 0 ? ["*"] : native.resources).some(
+              (resource) => permissionEffect(asker.rules ?? [], native.action, resource) === "deny",
+            );
+          entry.answering = true;
           if (
             native.type === "permission" &&
+            asker.restrictedAgent === undefined &&
             (decision === "acceptForSession" || decision === "acceptAlways")
           ) {
             const state = asker;
@@ -3859,7 +3949,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                   .reply({
                     sessionID,
                     requestID: Permission.ID.make(native.id),
-                    decision: decision !== undefined && approves(decision) ? "once" : "reject",
+                    decision:
+                      !denied && decision !== undefined && approves(decision) ? "once" : "reject",
                     ...(decision === "decline" ? { message: DECLINED } : {}),
                   })
                   .pipe(Effect.catchTags(permissionGone)),
@@ -4016,7 +4107,15 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           // Forks inherit source worktrees and skip initial resume; relocate to the destination now.
           const cwd = forkInput.runtimePolicy?.cwd;
           const state = register(providerThread, forked, cwd ?? forked.location.directory);
-          yield* writeRules(state, forkInput.runtimePolicy ?? state.policy);
+          state.restrictedAgent = getModelSelectionStringOptionValue(
+            source.nativeMetadata?.modelSelection,
+            "agent",
+          );
+          yield* writeRules(
+            state,
+            forkInput.runtimePolicy ?? state.policy,
+            forkInput.modelSelection,
+          );
           if (cwd != null && forked.location.directory !== cwd) {
             yield* client.session.move({
               sessionID: Session.ID.make(forked.id),

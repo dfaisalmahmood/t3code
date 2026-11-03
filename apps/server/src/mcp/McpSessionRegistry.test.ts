@@ -29,6 +29,9 @@ const makeRegistry = (now: () => number, httpServer = fakeHttpServer) =>
     .pipe(
       Effect.provideService(HttpServer.HttpServer, httpServer),
       Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+      Effect.provideService(McpSessionRegistry.McpToolCatalog, {
+        names: Effect.succeed(["t3_thread_read", "t3_terminal_run"]),
+      }),
       Effect.provide(NodeServices.layer),
     );
 
@@ -42,6 +45,7 @@ it.effect("stores only a token hash, resolves the bearer token, and revokes by t
       providerInstanceId: ProviderInstanceId.make("codex"),
       capabilities: new Set(["preview"]),
     });
+    expect(issued.config.toolNames).toEqual(["t3_thread_read", "t3_terminal_run"]);
     expect(issued.config.endpoint).toBe("http://127.0.0.1:43123/mcp");
     const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
     expect(token.length).toBeGreaterThan(20);

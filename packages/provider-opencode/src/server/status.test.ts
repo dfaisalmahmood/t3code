@@ -11,6 +11,7 @@ import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Schema from "effect/Schema";
 import * as Tracer from "effect/Tracer";
+import { TestClock } from "effect/testing";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import { beforeEach } from "vite-plus/test";
@@ -21,6 +22,7 @@ import * as OpenCodeServerOwner from "./OpenCodeServerOwner.ts";
 import {
   checkOpenCodeProviderStatus,
   loadOpenCode2Workspace,
+  makeOpenCode2ModelLoader,
   type OpenCode2Model,
   type OpenCode2Workspace,
 } from "./status.ts";
@@ -32,6 +34,31 @@ import {
   replayOpenCodeServer,
 } from "./probeResponses.fixture.ts";
 const decodeOpenCodeSettings = Schema.decodeSync(OpenCodeSettings);
+
+it.effect("waits for a stable agent inventory when models have already settled", () =>
+  Effect.gen(function* () {
+    let reads = 0;
+    const load = yield* makeOpenCode2ModelLoader(
+      Effect.sync((): ReadonlyArray<OpenCode2Model> => {
+        reads++;
+        return [
+          {
+            providerID: "opencode",
+            id: "big-pickle",
+            name: "Big Pickle",
+            variants: [],
+            agents:
+              reads === 1 ? [] : [{ id: "mason", name: "Mason", mode: "primary", hidden: false }],
+          },
+        ];
+      }),
+    );
+    const result = yield* load.pipe(Effect.forkScoped);
+    yield* TestClock.adjust("500 millis");
+    NodeAssert.equal((yield* Fiber.join(result))[0]?.agents?.[0]?.id, "mason");
+    NodeAssert.equal(reads, 3);
+  }).pipe(Effect.scoped),
+);
 
 const DEFAULT_VERSION_STDOUT = "opencode 1.14.19\n";
 
@@ -795,6 +822,13 @@ it.layer(layerTest)("checkOpenCodeProviderStatus", (it) => {
             id: "space-bunny-free",
             name: "Space Bunny Free",
             variants: [{ id: "low" }, { id: "medium" }, { id: "high" }],
+            agents: [
+              { id: "build", name: "Build", mode: "primary", hidden: false },
+              { id: "mason", name: "Mason", mode: "primary", hidden: false },
+              { id: "all-tools", name: "All tools", mode: "all", hidden: false },
+              { id: "hidden", name: "Hidden", mode: "primary", hidden: true },
+              { id: "child", name: "Child", mode: "subagent", hidden: false },
+            ],
           },
         ]),
       );
@@ -823,6 +857,14 @@ it.layer(layerTest)("checkOpenCodeProviderStatus", (it) => {
         variant?.type === "select" ? variant.options.map((option) => option.id) : [],
         ["low", "medium", "high"],
       );
+      const agent = snapshot.models
+        .find((model) => model.slug === "opencode/space-bunny-free")
+        ?.capabilities?.optionDescriptors?.find((descriptor) => descriptor.id === "agent");
+      NodeAssert.deepEqual(
+        agent?.type === "select" ? agent.options.map((option) => option.id) : [],
+        ["build", "mason", "all-tools"],
+      );
+      NodeAssert.equal(agent?.type === "select" ? agent.currentValue : undefined, "build");
       NodeAssert.equal(runtimeMock.state.sdkClientInputs.length, 0);
     }),
   );

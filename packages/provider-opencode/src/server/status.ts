@@ -453,6 +453,12 @@ export interface OpenCode2Model extends OpenCodeRelease {
   readonly name: string;
   readonly providerName?: string;
   readonly variants: ReadonlyArray<{ readonly id: string }>;
+  readonly agents?: ReadonlyArray<{
+    readonly id: string;
+    readonly name: string;
+    readonly mode: "primary" | "subagent" | "all";
+    readonly hidden: boolean;
+  }>;
 }
 
 // Sub-provider names distinguish overlapping catalog entries.
@@ -475,6 +481,7 @@ const catalogFingerprint = (models: ReadonlyArray<OpenCode2Model>) =>
         model.name,
         model.providerName,
         model.variants.map((variant) => variant.id).toSorted(),
+        model.agents?.map(({ id, name, mode, hidden }) => [id, name, mode, hidden]).toSorted(),
       ]),
     )
     .toSorted()
@@ -582,15 +589,19 @@ const OPENCODE_2_PRESENTATION = {
 function openCode2ModelCapabilities(model: OpenCode2Model): ModelCapabilities {
   const variants = model.variants.map((variant) => variant.id);
   const defaultVariant = inferDefaultVariant(model.providerID, variants);
+  const agents = (model.agents ?? []).filter(
+    (agent) => !agent.hidden && (agent.mode === "primary" || agent.mode === "all"),
+  );
+  const defaultAgent = agents.find((agent) => agent.id === "build")?.id ?? agents[0]?.id;
   return createModelCapabilities({
-    optionDescriptors:
-      variants.length === 0
+    optionDescriptors: [
+      ...(variants.length === 0
         ? []
         : [
             {
               id: "variant",
               label: "Reasoning",
-              type: "select",
+              type: "select" as const,
               options: variants.map((id) => ({
                 id,
                 label: titleCaseSlug(id),
@@ -598,7 +609,23 @@ function openCode2ModelCapabilities(model: OpenCode2Model): ModelCapabilities {
               })),
               ...(defaultVariant === undefined ? {} : { currentValue: defaultVariant }),
             },
-          ],
+          ]),
+      ...(agents.length === 0
+        ? []
+        : [
+            {
+              id: "agent",
+              label: "Agent",
+              type: "select" as const,
+              options: agents.map((agent) => ({
+                id: agent.id,
+                label: agent.name,
+                ...(agent.id === defaultAgent ? { isDefault: true } : {}),
+              })),
+              ...(defaultAgent === undefined ? {} : { currentValue: defaultAgent }),
+            },
+          ]),
+    ],
   });
 }
 
