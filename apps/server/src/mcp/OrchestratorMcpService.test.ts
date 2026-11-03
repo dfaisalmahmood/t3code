@@ -1129,6 +1129,109 @@ describe("OrchestratorMcpService provider resolution", () => {
   } as unknown as OrchestrationV2ThreadProjection;
 
   it.effect(
+    "uses the caller cwd catalog for capabilities and rejects host-only launch options",
+    () =>
+      Effect.gen(function* () {
+        let cwd = "/a";
+        const scopedModel = (agent: string) => ({
+          slug: "gpt-5.4",
+          name: "Project",
+          isCustom: false,
+          capabilities: {
+            optionDescriptors: [
+              {
+                id: "agent",
+                label: "Agent",
+                type: "select" as const,
+                options: [{ id: agent, label: agent }],
+              },
+            ],
+          },
+        });
+        const host = providerSnapshot({
+          instanceId: codexInstanceId,
+          driver: ProviderDriverKind.make("codex"),
+        });
+        const snapshot = (cwd: string, models?: ServerProvider["models"]) => ({
+          cwd,
+          checkedAt: host.checkedAt,
+          slashCommands: [],
+          skills: [],
+          ...(models === undefined ? {} : { models }),
+        });
+        let providers: ReadonlyArray<ServerProvider> = [
+          {
+            ...host,
+            workspaceSnapshots: [
+              snapshot("/a", [scopedModel("alpha")]),
+              snapshot("/b", [scopedModel("beta")]),
+              snapshot("/empty", []),
+              snapshot("/legacy"),
+            ],
+          },
+        ];
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          ServerSettings.layerTest(),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () =>
+              Effect.succeed({
+                ...parentProjection([]),
+                thread: { ...parentProjection([]).thread, worktreePath: cwd },
+              }),
+            hasReceipt: () => Effect.succeed(false),
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.sync(() => providers),
+          }),
+          adapterRegistryLayer([codexInstanceId]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          for (const [directory, agent] of [
+            ["/a", "alpha"],
+            ["/b", "beta"],
+          ] as const) {
+            cwd = directory;
+            const result = yield* service.capabilities(scope);
+            assert.deepEqual(result.providers[0]?.models[0]?.options, [
+              { id: "agent", values: [agent] },
+            ]);
+            const rejected = yield* service
+              .delegateTask(scope, {
+                task: "test",
+                mode: "async",
+                clientRequestId: directory,
+                target: { options: [{ id: "agent", value: "host" }] },
+              })
+              .pipe(Effect.flip);
+            assert.equal(rejected.code, "invalid_request");
+          }
+          providers = providers.map((provider) => ({ ...provider, models: [scopedModel("host")] }));
+          cwd = "/empty";
+          assert.deepEqual((yield* service.capabilities(scope)).providers[0]?.models, []);
+          const rejected = yield* service
+            .delegateTask(scope, {
+              task: "test",
+              mode: "async",
+              clientRequestId: "empty",
+              target: { model: "gpt-5.4" },
+            })
+            .pipe(Effect.flip);
+          assert.equal(rejected.code, "model_unavailable");
+          cwd = "/legacy";
+          assert.deepEqual((yield* service.capabilities(scope)).providers[0]?.models[0]?.options, [
+            { id: "agent", values: ["host"] },
+          ]);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+  );
+
+  it.effect(
     "advertises orchestration capability from registered adapters rather than a driver allowlist",
     () =>
       Effect.gen(function* () {
@@ -1570,7 +1673,10 @@ describe("OrchestratorMcpService provider resolution", () => {
           getThreadRecords: (threadId) =>
             Effect.succeed(
               threadId === parentThreadId
-                ? parentProjection(delegated ? [task] : [])
+                ? {
+                    ...parentProjection(delegated ? [task] : []),
+                    thread: { ...parentProjection([]).thread, worktreePath: "/project" },
+                  }
                 : childProjection,
             ),
           isProviderInstanceEnabledForProject: ({ instanceId }) =>
@@ -1609,11 +1715,24 @@ describe("OrchestratorMcpService provider resolution", () => {
             driver: ProviderDriverKind.make("codex"),
             model: "gpt-5.4",
           }),
-          providerSnapshot({
-            instanceId: altInstanceId,
-            driver: ProviderDriverKind.make("codex"),
-            model: "gpt-5.4",
-          }),
+          {
+            ...providerSnapshot({
+              instanceId: altInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+              model: "host-only",
+            }),
+            workspaceSnapshots: [
+              {
+                cwd: "/project",
+                checkedAt: "2026-09-13T00:00:00.000Z",
+                slashCommands: [],
+                skills: [],
+                models: [
+                  { slug: "project-default", name: "Project", isCustom: false, capabilities: null },
+                ],
+              },
+            ],
+          },
         ]),
         adapterRegistryLayer([codexInstanceId, altInstanceId]),
         Layer.mock(ProjectService.ProjectService)({}),
@@ -1638,6 +1757,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           modelSelection: { instanceId: string; model: string };
         };
         assert.equal(request.modelSelection.instanceId, altInstanceId);
+        assert.equal(request.modelSelection.model, "project-default");
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
     }),
   );

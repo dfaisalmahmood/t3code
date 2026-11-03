@@ -3,6 +3,7 @@ import {
   MODEL_SLUG_ALIASES_BY_PROVIDER,
   ModelCapabilities,
   type ModelSelection,
+  type ServerProvider,
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderOptionDescriptor,
@@ -521,4 +522,15 @@ export function applyClaudePromptEffortPrefix(
     return trimmed;
   }
   return `Ultrathink:\n${trimmed}`;
+}
+
+export function resolveProviderForCwd(
+  provider: ServerProvider,
+  cwd: string | null | undefined,
+): ServerProvider {
+  const models =
+    cwd == null
+      ? undefined
+      : provider.workspaceSnapshots?.find((snapshot) => snapshot.cwd === cwd)?.models;
+  return models === undefined ? provider : { ...provider, models };
 }

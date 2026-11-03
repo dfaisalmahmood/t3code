@@ -66,6 +66,56 @@ describe("mobile model options", () => {
         },
       })),
     );
+    const scopedConfig = {
+      ...config,
+      providers: config.providers.map((provider) => ({
+        ...provider,
+        models: [],
+        workspaceSnapshots: ["/a", "/b", "/empty", "/legacy"].map((cwd) => ({
+          cwd,
+          checkedAt: "2026-01-01T00:00:00.000Z",
+          slashCommands: [],
+          skills: [],
+          ...(cwd === "/legacy"
+            ? {}
+            : {
+                models:
+                  cwd === "/empty"
+                    ? []
+                    : [
+                        {
+                          ...provider.models[0]!,
+                          capabilities: {
+                            optionDescriptors: [
+                              {
+                                id: "agent",
+                                label: "Agent",
+                                type: "select" as const,
+                                options: [{ id: cwd, label: cwd }],
+                              },
+                            ],
+                          },
+                        },
+                      ],
+              }),
+        })),
+      })),
+    };
+    for (const cwd of ["/a", "/b"]) {
+      expect(
+        buildModelOptions(scopedConfig, null, undefined, null, false, cwd)[0]?.capabilities
+          ?.optionDescriptors,
+      ).toMatchObject([{ id: "agent", options: [{ id: cwd }] }]);
+    }
+    const withHost = {
+      ...scopedConfig,
+      providers: scopedConfig.providers.map((provider) => ({
+        ...provider,
+        models: config.providers[0]!.models,
+      })),
+    };
+    expect(buildModelOptions(withHost, null, undefined, null, false, "/empty")).toEqual([]);
+    expect(buildModelOptions(withHost, null, undefined, null, false, "/legacy")).toHaveLength(3);
     expect(groupByProvider(options)).toEqual([
       { providerKey: "opencode_work", providerLabel: "OpenCode Work", models: options },
     ]);

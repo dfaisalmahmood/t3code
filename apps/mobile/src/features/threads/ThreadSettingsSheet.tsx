@@ -270,6 +270,7 @@ type ThreadSettingsSubmenuPage =
 type ThreadSettingsSessionProps = {
   readonly environmentId: EnvironmentId | null;
   readonly projectId: ProjectId | null;
+  readonly cwd?: string | null;
   readonly providerInstanceId?: ProviderInstanceId;
   readonly lockedProviderInstanceId?: ProviderInstanceId;
   readonly providerGroups: ReadonlyArray<ProviderGroup>;
@@ -356,6 +357,7 @@ function ThreadSettingsSessionProvider(
             props.lockedProviderInstanceId,
             props.projectId,
             true,
+            props.cwd,
           ),
         )
       : props.providerGroups;
@@ -1504,8 +1506,12 @@ export function ExistingThreadSettingsRouteScreen({
 }: StaticScreenProps<ExistingThreadSettingsRouteParams>) {
   const navigation = useNavigation<NativeStackNavigationProp<Record<string, object | undefined>>>();
   // Reads the same environmentId/threadId params as the Thread route beneath it.
-  const { selectedThread, selectedThreadDetailRef, selectedEnvironmentRuntime } =
-    useThreadSelection();
+  const {
+    selectedThread,
+    selectedThreadProject,
+    selectedThreadDetailRef,
+    selectedEnvironmentRuntime,
+  } = useThreadSelection();
   // Streamed text would otherwise re-render the whole model picker on every delta.
   const structure = useQuietThreadStructure(selectedThreadDetailRef);
   const reportedModelSelection = useThreadReportedModelSelection(selectedThreadDetailRef);
@@ -1533,6 +1539,8 @@ export function ExistingThreadSettingsRouteScreen({
     modelSelection,
     lockedProviderInstanceId,
     selectedThread.projectId,
+    false,
+    selectedThread.worktreePath ?? selectedThreadProject?.workspaceRoot,
   );
   const currentModelOption =
     modelOptions.find(
@@ -1547,6 +1555,7 @@ export function ExistingThreadSettingsRouteScreen({
     <ThreadSettingsPickerScreen
       environmentId={selectedThread.environmentId}
       projectId={selectedThread.projectId}
+      cwd={selectedThread.worktreePath ?? selectedThreadProject?.workspaceRoot}
       providerInstanceId={modelSelection.instanceId}
       {...(lockedProviderInstanceId ? { lockedProviderInstanceId } : {})}
       providerGroups={groupByProvider(modelOptions)}
@@ -1584,6 +1593,7 @@ export function NewTaskThreadSettingsRouteScreen() {
     <ThreadSettingsPickerScreen
       environmentId={flow.selectedEnvironmentId}
       projectId={flow.selectedProject?.id ?? null}
+      cwd={flow.selectedWorktreePath ?? flow.selectedProject?.workspaceRoot}
       {...(flow.selectedModel ? { providerInstanceId: flow.selectedModel.instanceId } : {})}
       providerGroups={flow.providerGroups}
       selectedModel={flow.selectedModel}

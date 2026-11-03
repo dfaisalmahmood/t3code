@@ -122,6 +122,7 @@ export const ServerProviderSkill = Schema.Struct({
 export type ServerProviderSkill = typeof ServerProviderSkill.Type;
 
 export const ServerProviderWorkspaceSnapshot = Schema.Struct({
+  models: Schema.optionalKey(Schema.Array(ServerProviderModel)),
   cwd: TrimmedNonEmptyString,
   checkedAt: IsoDateTime,
   slashCommands: Schema.Array(ServerProviderSlashCommand),
