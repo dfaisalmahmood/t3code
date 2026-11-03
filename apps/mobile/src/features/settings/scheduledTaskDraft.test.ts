@@ -1,3 +1,4 @@
+import { buildModelOptions } from "../../lib/modelOptions";
 import { describe, expect, it } from "vite-plus/test";
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -7,6 +8,7 @@ import {
   ProjectId,
 } from "@t3tools/contracts";
 import {
+  scheduledTaskModelConfig,
   scheduledTaskDefaultModel,
   DEFAULT_SCHEDULE,
   scheduleDraftForTask,
@@ -145,6 +147,71 @@ describe("scheduled task model defaults", () => {
     ],
   } as unknown as ServerConfig;
   const resolve = scheduledTaskDefaultModel;
+
+  it("uses the scheduled workspace catalog for defaults and agent options across project switches", () => {
+    const model = (slug: string, agent: string) => ({
+      slug,
+      name: slug,
+      isCustom: false,
+      isDefault: true,
+      capabilities: {
+        optionDescriptors: [
+          {
+            id: "agent",
+            label: "Agent",
+            type: "select" as const,
+            options: [{ id: agent, label: agent }],
+          },
+        ],
+      },
+    });
+    for (const hostModels of [[], [model("host", "host-agent")]]) {
+      const scoped = {
+        ...config,
+        settings: { ...config.settings, defaultModelSelection: { instanceId, model: "host" } },
+        providers: config.providers.map((provider) => ({
+          ...provider,
+          models: hostModels,
+          workspaceSnapshots: ["/a", "/b", "/checkout", "/empty", "/legacy"].map((cwd) => ({
+            cwd,
+            checkedAt: "2026-01-01T00:00:00.000Z",
+            slashCommands: [],
+            skills: [],
+            ...(cwd === "/legacy"
+              ? {}
+              : { models: cwd === "/empty" ? [] : [model(cwd, `${cwd}-agent`)] }),
+          })),
+        })),
+      };
+      for (const [root, workspace, path, want] of [
+        ["/a", "worktree", "", "/a"],
+        ["/b", "root", "", "/b"],
+        ["/a", "existing_worktree", " /checkout ", "/checkout"],
+        ["/empty", "worktree", "", null],
+        ["/legacy", "root", "", hostModels.length ? "host" : null],
+        ["/missing", "root", "", hostModels.length ? "host" : null],
+      ] as const) {
+        const project = { id: projectId, workspaceRoot: root };
+        const draft = { workspace, checkoutPath: path };
+        const view = scheduledTaskModelConfig(scoped, project, draft);
+        expect(scheduledTaskDefaultModel(scoped, project, draft)).toEqual(
+          root === "/legacy" || root === "/missing"
+            ? { instanceId, model: "host" }
+            : want
+              ? { instanceId, model: want }
+              : null,
+        );
+        const options = buildModelOptions(view, null, undefined, projectId);
+        expect(options.map((option) => option.selection.model)).toEqual(want ? [want] : []);
+        if (want)
+          expect(options[0]?.capabilities?.optionDescriptors).toMatchObject([
+            { id: "agent", options: [{ id: `${want}-agent` }] },
+          ]);
+        expect(scoped.providers[0]?.models).toEqual(hostModels);
+        expect(view?.providers?.[0]?.status).toBe("ready");
+      }
+    }
+  });
   it("prefers the project's configured model", () => {
     expect(resolve(config, { id: projectId, defaultModelSelection: projectSelection })).toEqual(
       projectSelection,

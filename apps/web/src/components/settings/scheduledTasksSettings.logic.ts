@@ -1,8 +1,10 @@
+import { resolveProviderForCwd } from "@t3tools/shared/model";
 import { isWebhookDedupeTemplate } from "@t3tools/contracts";
 import {
   EnvironmentId,
   MAX_WEBHOOK_DELIVERY_AGE_MINUTES,
   type ProjectId,
+  type ServerProvider,
   ScheduledTaskId,
   type ScheduledTask,
   type ScheduledTaskUpsertSchedule,
@@ -252,10 +254,23 @@ export function taskToDraft(task: ScheduledTask): DraftState {
   };
 }
 
+export function scheduledTaskProviders(
+  providers: ReadonlyArray<ServerProvider>,
+  project: { readonly workspaceRoot: string } | null | undefined,
+  draft: Pick<DraftState, "workspaceMode" | "existingWorktreePath">,
+): ReadonlyArray<ServerProvider> {
+  const cwd =
+    draft.workspaceMode === "existing_worktree"
+      ? draft.existingWorktreePath.trim() || project?.workspaceRoot
+      : project?.workspaceRoot;
+  return providers.map((provider) => resolveProviderForCwd(provider, cwd));
+}
+
 export function scheduledTaskDefaultModel(
   settings: ServerSettings,
   project: (LegacyProjectSettingsFields & { readonly id: ProjectId }) | null,
   entries: readonly ProviderInstanceEntry[],
+  cwd?: string | null,
 ): ModelSelection | null {
   const available = entries.filter(
     (entry) =>
@@ -272,7 +287,10 @@ export function scheduledTaskDefaultModel(
       available.some(
         (entry) =>
           entry.instanceId === selection.instanceId &&
-          entry.models.find((model) => model.slug === selection.model)?.isLegacy !== true,
+          entry.models.find((model) => model.slug === selection.model)?.isLegacy !== true &&
+          (entry.snapshot.workspaceSnapshots?.find((snapshot) => snapshot.cwd === cwd)?.models ===
+            undefined ||
+            entry.models.some((model) => model.slug === selection.model)),
       )
     )
       return selection;

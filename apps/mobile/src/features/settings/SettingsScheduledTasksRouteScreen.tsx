@@ -74,6 +74,7 @@ import {
   editDraft,
   parseIntervalMinutes,
   scheduledTaskDefaultModel,
+  scheduledTaskModelConfig,
   scheduleFromDraft,
   type ScheduledTaskDraft as Draft,
 } from "./scheduledTaskDraft";
@@ -677,7 +678,9 @@ function TaskForm({
     )
     .sort((left, right) => Number(right.pinnedAt != null) - Number(left.pinnedAt != null));
   const config = useEnvironmentServerConfig(environmentId);
-  const modelOptions = buildModelOptions(config, null, undefined, draft.projectId);
+  const project = projects.find((project) => project.id === draft.projectId) ?? null;
+  const modelConfig = scheduledTaskModelConfig(config, project, draft);
+  const modelOptions = buildModelOptions(modelConfig, null, undefined, draft.projectId);
   const canOperate = useAtomValue(
     serverEnvironment.upsertScheduledTask.permissionAtom(environmentId),
   );
@@ -880,7 +883,7 @@ function TaskForm({
                 projectId: project.id,
                 modelSelection: keepsExplicitModel
                   ? draft.modelSelection
-                  : scheduledTaskDefaultModel(config, project),
+                  : scheduledTaskDefaultModel(config, project, draft),
                 modelSelectionIsExplicit: keepsExplicitModel,
               });
             }}

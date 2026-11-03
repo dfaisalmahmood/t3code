@@ -1,3 +1,4 @@
+import { resolveProviderForCwd } from "@t3tools/shared/model";
 import { isWebhookDedupeTemplate } from "@t3tools/contracts";
 import type {
   ModelSelection,
@@ -27,16 +28,57 @@ import {
   resolveNewTaskModelSelection,
 } from "../../lib/modelOptions";
 
-export function scheduledTaskDefaultModel(
+export function scheduledTaskCatalogCwd(
+  project: { readonly workspaceRoot?: string } | null,
+  workspace?: Pick<ScheduledTaskDraft, "workspace" | "checkoutPath">,
+): string | undefined {
+  return workspace?.workspace === "existing_worktree"
+    ? workspace.checkoutPath.trim() || project?.workspaceRoot
+    : project?.workspaceRoot;
+}
+
+export function scheduledTaskModelConfig(
   config: ServerConfig | null,
-  project: (LegacyProjectSettingsFields & { readonly id: ProjectId }) | null,
+  project: { readonly workspaceRoot?: string } | null,
+  workspace?: Pick<ScheduledTaskDraft, "workspace" | "checkoutPath">,
+): ServerConfig | null {
+  const cwd = scheduledTaskCatalogCwd(project, workspace);
+  return config
+    ? {
+        ...config,
+        providers: config.providers.map((provider) => resolveProviderForCwd(provider, cwd)),
+      }
+    : config;
+}
+
+export function scheduledTaskDefaultModel(
+  machineConfig: ServerConfig | null,
+  project:
+    | (LegacyProjectSettingsFields & { readonly id: ProjectId; readonly workspaceRoot?: string })
+    | null,
+  workspace?: Pick<ScheduledTaskDraft, "workspace" | "checkoutPath">,
 ): ModelSelection | null {
+  const config = scheduledTaskModelConfig(machineConfig, project, workspace);
+  const cwd = scheduledTaskCatalogCwd(project, workspace);
+  const defaultable = (selection: ModelSelection | null) => {
+    const resolved = resolveDefaultableModelSelection(config, selection, project?.id ?? null);
+    const provider = config?.providers.find(
+      (provider) => provider.instanceId === resolved?.instanceId,
+    );
+    const scopedModels = provider?.workspaceSnapshots?.find(
+      (snapshot) => snapshot.cwd === cwd,
+    )?.models;
+    return resolved &&
+      scopedModels !== undefined &&
+      !scopedModels.some((model) => model.slug === resolved.model)
+      ? null
+      : resolved;
+  };
   const settings = config?.settings ?? DEFAULT_SERVER_SETTINGS;
   const configured = resolveProjectSettings(settings, project?.id ?? null, project).settings
     .defaultModelSelection;
   const projectDefaultSelection =
-    resolveDefaultableModelSelection(config, configured, project?.id ?? null) ??
-    resolveDefaultableModelSelection(config, settings.defaultModelSelection, project?.id ?? null);
+    defaultable(configured) ?? defaultable(settings.defaultModelSelection);
   return resolveNewTaskModelSelection({
     draftSelection: null,
     projectDefaultSelection,
