@@ -91,6 +91,13 @@ const writesThread = <P extends { readonly threadId?: ThreadId | undefined }, A,
 ) => McpToolAccess.writesThreads((params: P) => [params.threadId], handle);
 
 export const layer = McpToolAccess.toLayer(ThreadToolkit, {
+  t3_thread_snooze: McpToolAccess.actsAsCaller((input) =>
+    dispatch(undefined, (common) => ({
+      ...common,
+      type: "thread.snooze",
+      snoozedUntil: input.snoozedUntil,
+    })),
+  ),
   run_scheduled_task_now: McpToolAccess.writesEnvironment((input) =>
     Effect.gen(function* () {
       const scheduler = yield* ScheduledTasks.ScheduledTaskService;

@@ -57,3 +57,29 @@ it("intersects supervised and plan ceilings with ordered profile permissions", (
   });
   assert.strictEqual(permissionEffect(reversed, "edit", "/notes/safe.md"), "deny");
 });
+
+it("uses native OpenCode wildcard normalization for action and resource rules", () => {
+  const rules = compileAgentPermissions({
+    profile: [
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "shell *", resource: "echo *", effect: "deny" },
+      { action: "edit", resource: "C:\\source\\*", effect: "deny" },
+    ],
+    runtimeMode: "approval-required",
+    interactionMode: "default",
+    mcpServerName: null,
+    mcpToolNames: [],
+  });
+  assert.strictEqual(permissionEffect(rules, "shell", "echo"), "deny");
+  assert.strictEqual(permissionEffect(rules, "shell", "echo safe"), "deny");
+  assert.strictEqual(permissionEffect(rules, "edit", "C:/source/app.ts"), "deny");
+  const windows = compileAgentPermissions({
+    platform: "win32",
+    profile: [{ action: "SHELL *", resource: "ECHO *", effect: "deny" }],
+    runtimeMode: "approval-required",
+    interactionMode: "default",
+    mcpServerName: null,
+    mcpToolNames: [],
+  });
+  assert.strictEqual(permissionEffect(windows, "shell", "echo", "win32"), "deny");
+});

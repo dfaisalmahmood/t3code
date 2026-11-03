@@ -1,4 +1,5 @@
 import * as NodeURL from "node:url";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import {
   AbsolutePath,
@@ -659,6 +660,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
   const crypto = yield* Crypto.Crypto;
   const driver = OPENCODE_PROVIDER;
+  const platform = yield* HostProcess.Platform;
   const mcpServerNameFor = (threadId: string) =>
     t3McpServerName(threadId).pipe(Effect.provideService(Crypto.Crypto, crypto));
 
@@ -2790,6 +2792,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         const mcp = appThreadId === null ? undefined : yield* mcpSessions.read(appThreadId);
         return compileAgentPermissions({
           profile: profile.permissions,
+          platform,
           ...policy,
           mcpServerName,
           mcpToolNames: mcp?.toolNames ?? [],
@@ -3912,7 +3915,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             native.type === "permission" &&
             asker.restrictedAgent !== undefined &&
             (native.resources.length === 0 ? ["*"] : native.resources).some(
-              (resource) => permissionEffect(asker.rules ?? [], native.action, resource) === "deny",
+              (resource) =>
+                permissionEffect(asker.rules ?? [], native.action, resource, platform) === "deny",
             );
           entry.answering = true;
           if (

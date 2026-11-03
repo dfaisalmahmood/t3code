@@ -1,22 +1,28 @@
 import type { Permission } from "@opencode/client/effect";
 import type { ProviderAdapterV2RuntimePolicy } from "@t3tools/provider-core/server/ProviderAdapter";
 
-const matches = (pattern: string, value: string) =>
-  new RegExp(
-    `^${pattern
-      .split(/([*?])/)
-      .map((part) => (part === "*" ? ".*" : part === "?" ? "." : RegExp.escape(part)))
-      .join("")}$`,
-    "s",
-  ).test(value);
+const matches = (pattern: string, value: string, platform = "posix") => {
+  let escaped = pattern
+    .replaceAll("\\", "/")
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  if (escaped.endsWith(" .*")) escaped = `${escaped.slice(0, -3)}( .*)?`;
+  return new RegExp(`^${escaped}$`, platform === "win32" ? "si" : "s").test(
+    value.replaceAll("\\", "/"),
+  );
+};
 
 export const permissionEffect = (
   rules: ReadonlyArray<Permission.Rule>,
   action: string,
   resource: string,
+  platform = "posix",
 ): Permission.Rule["effect"] =>
-  rules.findLast((entry) => matches(entry.action, action) && matches(entry.resource, resource))
-    ?.effect ?? "ask";
+  rules.findLast(
+    (entry) =>
+      matches(entry.action, action, platform) && matches(entry.resource, resource, platform),
+  )?.effect ?? "ask";
 
 const bounded = (
   effect: Permission.Rule["effect"],
@@ -29,6 +35,7 @@ const bounded = (
       : "allow";
 
 export const compileAgentPermissions = (input: {
+  readonly platform?: string;
   readonly profile: ReadonlyArray<Permission.Rule>;
   readonly runtimeMode: ProviderAdapterV2RuntimePolicy["runtimeMode"];
   readonly interactionMode: ProviderAdapterV2RuntimePolicy["interactionMode"];
@@ -41,7 +48,7 @@ export const compileAgentPermissions = (input: {
   ): ReadonlyArray<Permission.Rule> => [
     { action, resource: "*", effect: bounded("ask", ceiling) },
     ...input.profile
-      .filter((entry) => matches(entry.action, action))
+      .filter((entry) => matches(entry.action, action, input.platform))
       .map((entry) => ({
         ...entry,
         action,
