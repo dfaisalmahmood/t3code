@@ -23,6 +23,7 @@ import {
   ProjectId,
   type ProviderApprovalDecision,
   ProviderInstanceId,
+  ProviderDriverKind,
   ProviderSessionId,
   ProviderSetupError,
   ProviderThreadId,
@@ -73,6 +74,7 @@ import type * as ProviderContinuationRequests from "@t3tools/provider-core/serve
 import * as ModelManifest from "../../provider/ModelManifest.ts";
 import { resolveProviderCompatibility } from "../../provider/providerCompatibility.ts";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
+import { loadCodexManagementRoles } from "../../provider/CodexManagementRoles.ts";
 import { withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
 import * as CodexAdapterV2Testkit from "./CodexAdapterV2.testkit.ts";
 
@@ -84,6 +86,42 @@ const isProviderAdapterEventStreamError = Schema.is(
   ProviderAdapter.ProviderAdapterEventStreamError,
 );
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
+const decodeRoleTestFrame = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    id: Schema.optional(Schema.Number),
+    method: Schema.String,
+    params: Schema.optional(Schema.Unknown),
+  }),
+);
+const decodeRoleTestThreadParams = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    developerInstructions: Schema.String,
+    model: Schema.String,
+    config: Schema.Record(Schema.String, Schema.Unknown),
+  }),
+);
+const decodeRoleTestTurnParams = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    additionalContext: Schema.Record(
+      Schema.String,
+      Schema.Struct({ kind: Schema.String, value: Schema.String }),
+    ),
+    approvalPolicy: Schema.String,
+    sandboxPolicy: Schema.Struct({ type: Schema.String, networkAccess: Schema.Boolean }),
+  }),
+);
+
+const decodeRoleTestInjection = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    items: Schema.Array(
+      Schema.Struct({
+        role: Schema.String,
+        content: Schema.Array(Schema.Struct({ text: Schema.String })),
+      }),
+    ),
+  }),
+);
 
 describe("CodexAdapterV2 context usage", () => {
   it("uses the current context rather than cumulative processed tokens", () => {
@@ -151,6 +189,45 @@ describe("CodexAdapterV2 assistant message streaming", () => {
 });
 
 describe("CodexAdapterV2 runtime policy", () => {
+  it.effect("pins management role instructions and never widens its native sandbox", () =>
+    Effect.gen(function* () {
+      const role = {
+        id: "example",
+        selectionId: "example@v1",
+        description: "Bounded",
+        instructions: "A bounded role 🦊",
+        allowedTools: [],
+        limitations: "Limited",
+        revision: "v1",
+      };
+      const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId: "role-turn",
+        codexInput: [{ type: "text", text: "work" }],
+        runtimePolicy: {
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: null,
+          approvalPolicy: "on-request",
+          sandboxPolicy: { type: "dangerFullAccess" },
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-6.1-sol",
+          options: [
+            { id: "agent", value: "example" },
+            { id: "reasoningEffort", value: "high" },
+          ],
+        },
+        role,
+      });
+      assert.equal(params.approvalPolicy, "never");
+      assert.equal(params.approvalsReviewer, "user");
+      assert.deepEqual(params.sandboxPolicy, { type: "readOnly", networkAccess: false });
+      assert.equal(params.additionalContext?.t3_code_role_001?.value, "A bounded role 🦊");
+      assert.equal(params.effort, "high");
+    }),
+  );
+
   it.effect.each([undefined, false, true])(
     "selects native collaboration modes without prompt overrides with hasT3Mcp=%s",
     (hasT3Mcp) =>
@@ -323,6 +400,20 @@ describe("CodexAdapterV2 native protocol logging", () => {
           },
         },
       });
+      yield* protocolLogger({
+        direction: "incoming",
+        stage: "decoded",
+        payload: {
+          id: 2,
+          result: {
+            config: {
+              mcp_servers: { foreign: { args: ["--credential", "secret-config-argument"] } },
+            },
+            layers: [{ config: { env: { PRIVATE_VALUE: "secret-config-argument" } } }],
+          },
+        },
+      });
+      assert.notInclude(JSON.stringify(writes.at(-1)?.event), "secret-config-argument");
     }),
   );
 });
@@ -2127,6 +2218,516 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         ),
       ),
     ),
+  );
+
+  it.effect.each(["current", "changed", "missing"] as const)(
+    "validates cold managed roles from the effective profile home without acquiring runtime (%s)",
+    (state) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const home = yield* fs.makeTempDirectoryScoped();
+          const managedHome = `${home}/managed-codex`;
+          const ambientHome = `${home}/ambient-codex`;
+          yield* fs.makeDirectory(`${managedHome}/agents`, { recursive: true });
+          yield* fs.makeDirectory(`${ambientHome}/agents`, { recursive: true });
+          yield* fs.makeDirectory(`${home}/.config/opencode/agents`, { recursive: true });
+          const instructions = "Managed manager instructions.";
+          const profilePath = `${managedHome}/agents/manager.toml`;
+          const envelope = `name = "manager"\ndescription = "Manager"\ndeveloper_instructions = ${JSON.stringify(instructions)}\n`;
+          yield* fs.writeFileString(profilePath, envelope);
+          yield* fs.writeFileString(
+            `${home}/.config/opencode/agents/manager.md`,
+            `---\n${JSON.stringify({ description: "Manager", mode: "primary", permission: { "*": "ask", read: "allow", glob: "allow", grep: "allow", list: "allow", webfetch: "allow", edit: "deny", bash: "deny", task: "deny" } })}\n---\n${instructions}`,
+          );
+          const environment = { HOME: home, CODEX_HOME: ambientHome };
+          const role = (yield* loadCodexManagementRoles({
+            homePath: managedHome,
+            environment,
+          }))[0]!;
+          const selection = {
+            ...CODEX_TEST_MODEL_SELECTION,
+            options: [{ id: "agent", value: role.selectionId }],
+          };
+          if (state === "changed")
+            yield* fs.writeFileString(
+              profilePath,
+              envelope.replace('description = "Manager"', 'description = "Changed"'),
+            );
+          if (state === "missing") yield* fs.remove(profilePath);
+          let runtimeAcquisitions = 0;
+          const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
+            instanceId: selection.instanceId,
+            settings: DEFAULT_CODEX_SETTINGS,
+            environment,
+            managementRoleSource: { homePath: managedHome, environment },
+            resolveRuntime: Effect.sync(() => {
+              runtimeAcquisitions++;
+            }).pipe(
+              Effect.andThen(
+                Effect.die("Runtime acquisition is forbidden during role validation."),
+              ),
+            ),
+            clientFactory: {
+              open: () => Effect.die("Native startup is forbidden during role validation."),
+            },
+            digest: yield* Digest.Digest,
+            fileSystem: fs,
+            idAllocator: yield* IdAllocator.IdAllocatorV2,
+            serverConfig: yield* ProviderReplayHarness.makeReplayServerConfig(
+              "managed-role-source",
+            ).pipe(Effect.orDie),
+          });
+          const validate = adapter.validateContextTransfer;
+          if (!validate) return yield* Effect.die("Missing role transfer validator");
+          const result = yield* validate({
+            providerSessionId: null,
+            modelSelection: selection,
+            targetModelSelection: selection,
+            targetDriver: ProviderDriverKind.make("codex"),
+          }).pipe(Effect.exit);
+          assert.equal(Exit.isSuccess(result), state === "current");
+          assert.equal(runtimeAcquisitions, 0);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each(["0.166.0", "0.167.0"])(
+    "keeps the installed role pinned through cold resume with omitted selection and refuses changed policy (%s)",
+    (nativeVersion) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const home = yield* fs.makeTempDirectoryScoped();
+          yield* fs.makeDirectory(`${home}/.codex/agents`, { recursive: true });
+          yield* fs.makeDirectory(`${home}/.config/opencode/agents`, { recursive: true });
+          const instructions = "# Manager 🦊\nUse scoped dispatch.\n";
+          yield* fs.writeFileString(
+            `${home}/.codex/agents/manager.toml`,
+            `name = "manager"\ndescription = "Manager"\ndeveloper_instructions = ${JSON.stringify(instructions)}\n`,
+          );
+          const policy = `---\n${JSON.stringify({ description: "Manager", mode: "primary", permission: { "*": "ask", read: "allow", glob: "allow", grep: "allow", list: "allow", webfetch: "allow", edit: "deny", bash: "deny", task: "deny", "t3-code-*_delegate_task": "allow", "t3-code-*_t3_thread_read": "allow" } })}\n---\n${instructions}`;
+          const policyPath = `${home}/.config/opencode/agents/manager.md`;
+          yield* fs.writeFileString(policyPath, policy);
+          const role = (yield* loadCodexManagementRoles({ environment: { HOME: home } }))[0]!;
+          const selection = {
+            ...CODEX_TEST_MODEL_SELECTION,
+            options: [
+              { id: "agent", value: role.selectionId },
+              { id: "reasoningEffort", value: "high" },
+            ],
+          };
+          const nativeThreadId = "role-native";
+          const frames: Array<{ readonly method: string; readonly params: unknown }> = [];
+          const incoming = yield* Queue.unbounded<Uint8Array, Cause.Done>();
+          const emit = (frame: unknown) =>
+            Queue.offer(incoming, new TextEncoder().encode(JSON.stringify(frame) + "\n"));
+          let nativeTurns = 0;
+          let inventoryMode: "disabled" | "unexpected" | "foreign-tool" = "disabled";
+          const restored = yield* Deferred.make<void>();
+          const client = yield* CodexClient.make(
+            Stdio.make({
+              args: Effect.succeed([]),
+              stdin: Stream.fromQueue(incoming),
+              stderr: () => Sink.drain,
+              stdout: () =>
+                Sink.forEach((chunk: string | Uint8Array) =>
+                  Effect.gen(function* () {
+                    const frame = yield* decodeRoleTestFrame(
+                      JSON.parse(
+                        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+                      ),
+                    ).pipe(Effect.orDie);
+                    frames.push({ method: frame.method, params: frame.params });
+                    if (frame.id === undefined) return;
+                    let result: unknown;
+                    if (frame.method === "initialize")
+                      result = {
+                        userAgent: `codex/${nativeVersion}`,
+                        codexHome: `${home}/.codex`,
+                        platformFamily: "unix",
+                        platformOs: "macos",
+                      };
+                    else if (frame.method === "config/read")
+                      result = {
+                        config: {
+                          developer_instructions: role.instructions,
+                          approval_policy: "never",
+                          sandbox_mode: "read-only",
+                          web_search: "disabled",
+                          features: {
+                            shell_tool: false,
+                            unified_exec: false,
+                            multi_agent: false,
+                            apps: false,
+                            goals: false,
+                            browser_use: false,
+                            browser_use_external: false,
+                            browser_use_full_cdp_access: false,
+                            computer_use: false,
+                            image_generation: false,
+                            in_app_browser: false,
+                            multi_agent_v2: false,
+                            code_mode: false,
+                            code_mode_host_grpc: false,
+                            remote_plugin: false,
+                            deferred_executor: false,
+                            plugins: false,
+                          },
+                          agents: { enabled: false },
+                          mcp_servers: { foreign_sensor: { enabled: true } },
+                        },
+                      };
+                    else if (frame.method === "thread/start") {
+                      const preamble = codexReplayPreamble({
+                        nativeThreadId,
+                        nativeTurnId: "unused",
+                        prompt: "unused",
+                      });
+                      const response = preamble.find(
+                        (entry) => entry.type === "emit_inbound" && entry.label === "thread/start",
+                      );
+                      if (
+                        response?.type !== "emit_inbound" ||
+                        !Predicate.isObject(response.frame) ||
+                        !Predicate.isObject(response.frame.result)
+                      )
+                        return yield* Effect.die("Missing thread fixture");
+                      result = {
+                        ...response.frame.result,
+                        approvalPolicy: "never",
+                        sandbox: { type: "readOnly", networkAccess: false },
+                      };
+                    } else if (frame.method === "thread/resume")
+                      result = {
+                        thread: { id: nativeThreadId, updatedAt: 1782622440 },
+                        approvalPolicy: "never",
+                        sandbox: { type: "readOnly", networkAccess: false },
+                      };
+                    else if (frame.method === "experimentalFeature/list")
+                      result = {
+                        data: [
+                          "multi_agent_v2",
+                          "code_mode",
+                          "code_mode_host_grpc",
+                          "remote_plugin",
+                          "deferred_executor",
+                          "shell_tool",
+                          "unified_exec",
+                          "multi_agent",
+                          "apps",
+                          "plugins",
+                          "goals",
+                          "browser_use",
+                          "browser_use_external",
+                          "browser_use_full_cdp_access",
+                          "computer_use",
+                          "image_generation",
+                          "in_app_browser",
+                        ]
+                          .map((name) => ({
+                            name,
+                            enabled: name === "unified_exec",
+                            defaultEnabled: true,
+                            stage: "stable",
+                          }))
+                          .concat([
+                            {
+                              name: "code_mode_host",
+                              enabled: true,
+                              defaultEnabled: true,
+                              stage: "stable",
+                            },
+                          ]),
+                        nextCursor: null,
+                      };
+                    else if (frame.method === "mcpServerStatus/list")
+                      result = {
+                        data: [
+                          {
+                            name:
+                              inventoryMode === "unexpected" ? "unknown_foreign" : "foreign_sensor",
+                            tools:
+                              inventoryMode === "foreign-tool"
+                                ? {
+                                    foreign_mutate: {
+                                      name: "foreign_mutate",
+                                      inputSchema: { type: "object" },
+                                    },
+                                  }
+                                : {},
+                            resources: [],
+                            resourceTemplates: [],
+                            authStatus: "unsupported",
+                          },
+                        ],
+                        nextCursor: null,
+                      };
+                    else if (frame.method === "turn/start")
+                      result = {
+                        turn: makeCodexReplayTurn({
+                          id: `role-turn-${++nativeTurns}`,
+                          status: "inProgress",
+                        }),
+                      };
+                    else result = {};
+                    if (frame.method === "thread/inject_items")
+                      yield* Deferred.succeed(restored, undefined);
+                    yield* emit({ id: frame.id, result });
+                  }),
+                ),
+            }),
+          );
+          const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
+            instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+            settings: DEFAULT_CODEX_SETTINGS,
+            environment: { HOME: home },
+            clientFactory: {
+              open: (input) => {
+                assert.equal(input.roleConfig?.["features.shell_tool"], false);
+                assert.equal(input.roleConfig?.developer_instructions, role.instructions);
+                return Effect.succeed(client);
+              },
+            },
+            digest: yield* Digest.Digest,
+            fileSystem: fs,
+            idAllocator: yield* IdAllocator.IdAllocatorV2,
+            serverConfig: yield* ProviderReplayHarness.makeReplayServerConfig("role-pinning").pipe(
+              Effect.orDie,
+            ),
+          });
+          const threadId = ThreadId.make("role-thread");
+          const open = adapter.openSession({
+            threadId,
+            providerSessionId: ProviderSessionId.make("role-session"),
+            modelSelection: selection,
+            runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+          });
+          if (nativeVersion !== "0.166.0") {
+            const failure = yield* open.pipe(Effect.flip);
+            assert.equal(failure._tag, "ProviderAdapterOpenSessionError");
+            assert.isFalse(frames.some((frame) => frame.method === "thread/start"));
+            return;
+          }
+          const runtime = yield* open;
+          const sessions = yield* McpProviderSessions.McpProviderSessions;
+          yield* sessions.set({
+            environmentId: EnvironmentId.make("test"),
+            threadId,
+            providerSessionId: "mcp-role",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            endpoint: "http://127.0.0.1/mcp",
+            authorizationHeader: "Bearer test",
+            browserToolsAvailable: false,
+            toolNames: ["delegate_task", "t3_thread_read", "t3_terminal_run"],
+          });
+          const providerThread = yield* runtime.ensureThread({
+            threadId,
+            modelSelection: selection,
+            runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+          });
+          yield* runtime.resumeThread({ providerThread });
+          const start = frames.find((frame) => frame.method === "thread/start")?.params;
+          const resume = frames.find((frame) => frame.method === "thread/resume")?.params;
+          for (const params of [start, resume]) {
+            const decoded = yield* decodeRoleTestThreadParams(params);
+            assert.equal(decoded.developerInstructions, role.instructions);
+            assert.equal(decoded.model, "gpt-5.4");
+            assert.equal(decoded.config["features.shell_tool"], false);
+            assert.equal(decoded.config["mcp_servers.foreign_sensor.enabled"], false);
+            assert.deepEqual(decoded.config["mcp_servers.t3-code"], {
+              url: "http://127.0.0.1/mcp",
+              tool_timeout_sec: 3900,
+              http_headers: { Authorization: "Bearer test" },
+              enabled_tools: ["delegate_task", "t3_thread_read"],
+              tools: {
+                delegate_task: { approval_mode: "approve" },
+                t3_thread_read: { approval_mode: "approve" },
+              },
+            });
+          }
+          assert.deepEqual((yield* sessions.read(threadId))?.allowedToolNames, [
+            "delegate_task",
+            "t3_thread_read",
+          ]);
+          const turn = {
+            ...makeCodexTestTurnInput({
+              threadId,
+              providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make("role-attempt"),
+              text: "work",
+            }),
+            modelSelection: selection,
+          };
+          yield* runtime.startTurn(turn);
+          const sent = yield* decodeRoleTestTurnParams(
+            frames.find((frame) => frame.method === "turn/start")?.params,
+          );
+          assert.equal(sent.additionalContext.t3_code_role_001?.value, role.instructions);
+          assert.equal(sent.approvalPolicy, "never");
+          assert.deepEqual(sent.sandboxPolicy, { type: "readOnly", networkAccess: false });
+          yield* emit({
+            method: "item/completed",
+            params: {
+              threadId: nativeThreadId,
+              turnId: "role-turn-1",
+              completedAtMs: 1782622450000,
+              item: { type: "contextCompaction", id: "role-compaction" },
+            },
+          });
+          yield* Deferred.await(restored);
+          const restoredItems = yield* decodeRoleTestInjection(
+            frames.find((frame) => frame.method === "thread/inject_items")?.params,
+          );
+          assert.isTrue(
+            restoredItems.items.some(
+              (item) =>
+                item.role === "developer" &&
+                item.content.some(
+                  (entry) =>
+                    entry.text === `<t3_code_role_001>${role.instructions}</t3_code_role_001>`,
+                ),
+            ),
+          );
+          const completed = yield* runtime.events.pipe(
+            Stream.filter((event) => event.type === "turn.terminal"),
+            Stream.runHead,
+            Effect.forkScoped,
+          );
+          yield* emit({
+            method: "turn/completed",
+            params: {
+              threadId: nativeThreadId,
+              turn: makeCodexReplayTurn({ id: "role-turn-1", status: "completed" }),
+            },
+          });
+          yield* Fiber.join(completed);
+          yield* runtime.startTurn({
+            ...turn,
+            runId: RunId.make("role-run-2"),
+            attemptId: RunAttemptId.make("role-attempt-2"),
+            runOrdinal: 2,
+            providerTurnOrdinal: 2,
+            modelSelection: { ...selection, model: "gpt-6.1-sol" },
+          });
+          const everyTurn = frames.filter((frame) => frame.method === "turn/start");
+          assert.lengthOf(everyTurn, 2);
+          for (const frame of everyTurn) {
+            const params = yield* decodeRoleTestTurnParams(frame.params);
+            assert.equal(params.additionalContext.t3_code_role_001?.value, role.instructions);
+          }
+          for (const mode of ["unexpected", "foreign-tool"] as const) {
+            inventoryMode = mode;
+            assert.isTrue(Exit.isFailure(yield* runtime.startTurn(turn).pipe(Effect.exit)));
+            assert.equal(nativeTurns, 2);
+          }
+          inventoryMode = "disabled";
+          yield* runtime.resumeThread({ providerThread });
+          const lastResume = yield* decodeRoleTestThreadParams(
+            frames.filter((frame) => frame.method === "thread/resume").at(-1)?.params,
+          );
+          assert.equal(lastResume.model, "gpt-6.1-sol");
+          assert.equal(lastResume.developerInstructions, role.instructions);
+          const validateTransfer = adapter.validateContextTransfer;
+          if (!validateTransfer) return yield* Effect.die("Missing source profile validation");
+          yield* validateTransfer({
+            providerSessionId: ProviderSessionId.make("role-session"),
+            modelSelection: null,
+            targetModelSelection: selection,
+            targetDriver: ProviderDriverKind.make("codex"),
+          });
+          yield* validateTransfer({
+            providerSessionId: ProviderSessionId.make("cold-source"),
+            modelSelection: selection,
+            targetModelSelection: selection,
+            targetDriver: ProviderDriverKind.make("codex"),
+          });
+          assert.isTrue(
+            (yield* validateTransfer({
+              providerSessionId: ProviderSessionId.make("cold-source"),
+              modelSelection: null,
+              targetModelSelection: selection,
+              targetDriver: ProviderDriverKind.make("codex"),
+            })).requiresFreshProviderThread,
+          );
+          assert.isTrue(
+            Exit.isFailure(
+              yield* validateTransfer({
+                providerSessionId: ProviderSessionId.make("role-session"),
+                modelSelection: selection,
+                targetModelSelection: selection,
+                targetDriver: ProviderDriverKind.make("opencode"),
+              }).pipe(Effect.exit),
+            ),
+          );
+          yield* fs.writeFileString(policyPath, policy.replace('"bash":"deny"', '"bash":"ask"'));
+          assert.isTrue(Exit.isFailure(yield* runtime.startTurn(turn).pipe(Effect.exit)));
+          assert.equal(nativeTurns, 2);
+          const updatedRole = (yield* loadCodexManagementRoles({
+            environment: { HOME: home },
+          }))[0]!;
+          for (const targetModelSelection of [
+            CODEX_TEST_MODEL_SELECTION,
+            { ...selection, options: [{ id: "agent", value: updatedRole.selectionId }] },
+          ])
+            assert.isTrue(
+              (yield* validateTransfer({
+                providerSessionId: ProviderSessionId.make("role-session"),
+                modelSelection: selection,
+                targetModelSelection,
+                targetDriver: ProviderDriverKind.make("codex"),
+              })).requiresFreshProviderThread,
+            );
+
+          assert.isTrue(
+            Exit.isFailure(
+              yield* validateTransfer({
+                providerSessionId: ProviderSessionId.make("role-session"),
+                modelSelection: null,
+                targetModelSelection: selection,
+                targetDriver: ProviderDriverKind.make("codex"),
+              }).pipe(Effect.exit),
+            ),
+          );
+          assert.isTrue(
+            Exit.isFailure(
+              yield* validateTransfer({
+                providerSessionId: ProviderSessionId.make("cold-source"),
+                modelSelection: selection,
+                targetModelSelection: selection,
+                targetDriver: ProviderDriverKind.make("codex"),
+              }).pipe(Effect.exit),
+            ),
+          );
+          assert.deepEqual(
+            yield* adapter.planSelectionTransition({
+              current: selection,
+              target: CODEX_TEST_MODEL_SELECTION,
+              sessionCapabilities: yield* adapter.getCapabilities(),
+            }),
+            { type: "create_with_handoff" },
+          );
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
+          ),
+        ),
+      ),
   );
 
   it.effect("preserves T3 context on the wire and restores it after compaction", () =>

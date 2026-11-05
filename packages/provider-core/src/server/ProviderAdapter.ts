@@ -668,10 +668,15 @@ export class ProviderAdapterV2 extends Context.Service<
   {
     readonly instanceId: ProviderInstanceId;
     readonly driver: ProviderDriverKind;
-    readonly getCapabilities: () => Effect.Effect<
-      OrchestrationV2ProviderCapabilities,
-      ProviderAdapterV2Error
-    >;
+    readonly getCapabilities: (
+      selection?: ModelSelection,
+    ) => Effect.Effect<OrchestrationV2ProviderCapabilities, ProviderAdapterV2Error>;
+    readonly validateContextTransfer?: (input: {
+      readonly providerSessionId: ProviderSessionId | null;
+      readonly modelSelection: ModelSelection | null;
+      readonly targetModelSelection: ModelSelection;
+      readonly targetDriver: ProviderDriverKind;
+    }) => Effect.Effect<{ readonly requiresFreshProviderThread: boolean }, ProviderAdapterV2Error>;
     readonly planSelectionTransition: (
       input: ProviderSelectionTransitionInput,
     ) => Effect.Effect<ProviderSelectionTransitionPlan, ProviderAdapterV2Error>;

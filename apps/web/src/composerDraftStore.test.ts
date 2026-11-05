@@ -1860,6 +1860,23 @@ describe("composerDraftStore sticky composer settings", () => {
     );
   });
 
+  it("does not restore a stale Agent into new drafts after an explicit ordinary pick", () => {
+    const store = useComposerDraftStore.getState();
+    const selected = modelSelection(CODEX_DRIVER, "gpt-6-sol");
+    store.setStickyModelSelection({ ...selected, options: [{ id: "agent", value: "mason" }] });
+    store.setStickyModelSelection(selected, { replaceOptions: true });
+    const draftId = DraftId.make("draft-after-ordinary-agent-pick");
+    store.applyStickyState(draftId);
+    expect(
+      useComposerDraftStore.getState().draftsByThreadKey[draftId]?.modelSelectionByProvider[
+        CODEX_INSTANCE
+      ],
+    ).toEqual(selected);
+    expect(useComposerDraftStore.getState().stickyModelSelectionByProvider[CODEX_INSTANCE]).toEqual(
+      selected,
+    );
+  });
+
   it("applies sticky activeProvider to new drafts", () => {
     const store = useComposerDraftStore.getState();
     const threadId = ThreadId.make("thread-sticky-active-provider");

@@ -54,13 +54,14 @@ export function decideProviderSessionTransition(input: {
   const runtimeChanged = current.runtimeMode !== target.runtimeMode;
   const workspaceChanged = current.workspace !== target.workspace;
   const selectionChanged = !modelSelectionsEqual(current.modelSelection, target.modelSelection);
-  if (selectionChanged && !instanceChanged) {
+  if (selectionChanged) {
     switch (input.selectionTransition?.type) {
       case "create_with_handoff":
         return { type: "create_with_handoff" };
       case "reject":
         return { type: "reject", reason: input.selectionTransition.reason };
       case undefined:
+        if (instanceChanged) break;
         return {
           type: "reject",
           reason: "The provider adapter did not classify the selection change.",

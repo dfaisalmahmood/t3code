@@ -2,6 +2,7 @@ import type {
   ModelSelection,
   ProviderDriverKind,
   ProviderOptionDescriptor,
+  ProviderOptionSelection,
 } from "@t3tools/contracts";
 import {
   buildProviderOptionSelectionsFromDescriptors,
@@ -90,6 +91,7 @@ export function getPromptControlledTraits(
 export function getTraitSelectChange(
   selected: ReturnType<typeof getPromptControlledTraits> & {
     descriptors: ReadonlyArray<ProviderOptionDescriptor>;
+    modelOptions?: ReadonlyArray<ProviderOptionSelection> | null | undefined;
   },
   descriptor: Extract<ProviderOptionDescriptor, { type: "select" }>,
   prompt: string,
@@ -105,6 +107,7 @@ export function getTraitSelectChange(
         : prompt,
     modelOptions: buildProviderOptionSelectionsFromDescriptors(
       replaceDescriptorCurrentValue(selected.descriptors, descriptor.id, value),
+      selected.modelOptions,
     ),
   };
 }

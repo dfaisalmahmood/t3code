@@ -12,6 +12,7 @@ import * as NetAddress from "effect/net/NetAddress";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 
 export class McpToolCatalog extends Context.Service<
@@ -91,6 +92,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const environmentId = yield* environment.getEnvironmentId;
   const httpServer = yield* HttpServer.HttpServer;
   const catalog = yield* Effect.serviceOption(McpToolCatalog);
+  const providerSessions = yield* Effect.serviceOption(McpProviderSessions.McpProviderSessions);
   const state = yield* SynchronizedRef.make<RegistryState>({ records: new Map() });
   const currentTimeMillis = options.now ? Effect.sync(options.now) : Clock.currentTimeMillis;
   const livenessWindowMs = options.livenessWindowMs ?? DEFAULT_LIVENESS_WINDOW_MS;
@@ -113,6 +115,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       const scope: McpInvocationContext.McpThreadInvocationScope = {
         environmentId,
         requestNamespace: providerSessionId,
+        providerCredential: true,
         thread: {
           threadId: ThreadId.make(request.threadId),
           providerSessionId,
@@ -154,14 +157,34 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       if (rawToken.length === 0) return undefined;
       const tokenHash = yield* hashToken(rawToken);
       const timestamp = yield* currentTimeMillis;
+      const record = (yield* SynchronizedRef.get(state)).records.get(tokenHash);
+      const session =
+        record && Option.isSome(providerSessions)
+          ? yield* providerSessions.value.read(record.scope.thread.threadId)
+          : undefined;
       return yield* SynchronizedRef.modify(state, ({ records }) => {
         const record = records.get(tokenHash);
         if (!record || timestamp - record.lastAliveAt > livenessWindowMs) {
           return [undefined, { records }] as const;
         }
         const next = new Map(records);
-        next.set(tokenHash, { ...record, lastAliveAt: timestamp });
-        return [record.scope, { records: next }] as const;
+        const ceiling = session?.allowedToolNames;
+        const allowedToolNames =
+          record.scope.allowedToolNames === undefined
+            ? ceiling
+            : record.scope.allowedToolNames.filter((name) => ceiling?.includes(name) ?? true);
+        const pinned =
+          allowedToolNames === undefined
+            ? record.scope
+            : {
+                ...record.scope,
+                allowedToolNames:
+                  session?.providerSessionId === record.scope.requestNamespace
+                    ? allowedToolNames
+                    : [],
+              };
+        next.set(tokenHash, { ...record, scope: pinned, lastAliveAt: timestamp });
+        return [pinned, { records: next }] as const;
       });
     },
   );

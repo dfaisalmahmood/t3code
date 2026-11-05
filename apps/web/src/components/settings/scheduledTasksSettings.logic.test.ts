@@ -20,12 +20,70 @@ import { getCustomModelOptionsByInstance } from "../../modelSelection";
 import { deriveProviderInstanceEntries } from "../../providerInstances";
 import {
   scheduledTaskProviders,
+  scheduledTaskModelSelection,
   scheduledTaskDefaultModel,
   defaultScheduledTaskProjectId,
   matchesScheduledTaskScope,
   scheduleFromDraft,
   taskToDraft,
 } from "./scheduledTasksSettings.logic";
+
+it("retains the scheduled task Agent when changing provider or model", () => {
+  const roleId = `mason@${"a".repeat(64)}`;
+  const source = {
+    instanceId: ProviderInstanceId.make("opencode"),
+    model: "openai/gpt-test",
+    options: [
+      { id: "agent", value: "mason" },
+      { id: "variant", value: "high" },
+    ],
+  };
+  const target = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-test" };
+  const providers = [
+    {
+      instanceId: target.instanceId,
+      driver: "codex",
+      models: [
+        {
+          slug: target.model,
+          capabilities: {
+            optionDescriptors: [
+              {
+                id: "agent",
+                label: "Agent",
+                type: "select",
+                options: [
+                  { id: "default", label: "Default", isDefault: true },
+                  { id: roleId, label: "Mason" },
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ] as unknown as ServerConfig["providers"];
+  expect(
+    scheduledTaskModelSelection({ currentSelection: source, targetSelection: target, providers }),
+  ).toEqual({
+    ...target,
+    options: [{ id: "agent", value: roleId }],
+  });
+  expect(
+    scheduledTaskModelSelection({ currentSelection: source, targetSelection: source, providers }),
+  ).toEqual(source);
+  expect(
+    scheduledTaskModelSelection({ currentSelection: null, targetSelection: source, providers }),
+  ).toEqual(source);
+  expect(
+    scheduledTaskModelSelection({
+      currentSelection: null,
+      effectiveSelection: source,
+      targetSelection: target,
+      providers,
+    }),
+  ).toEqual({ ...target, options: [{ id: "agent", value: roleId }] });
+});
 
 const laptopId = EnvironmentId.make("laptop");
 const serverId = EnvironmentId.make("server");

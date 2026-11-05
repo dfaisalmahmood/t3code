@@ -1,5 +1,10 @@
 import type { ModelOption, ProviderGroup } from "../../lib/modelOptions";
 import type { ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
+import {
+  buildExplicitProviderOptionSelectionsFromDescriptors,
+  carryProviderAgentSelection,
+  getProviderOptionDescriptors,
+} from "@t3tools/shared/model";
 
 export function modelFavoriteKey(provider: ProviderInstanceId, model: string): string {
   return `${provider}:${model}`;
@@ -47,9 +52,29 @@ export function pendingModelAfterPress(input: {
   if (input.current?.key === input.pressed.key) {
     return input.current;
   }
-  return input.restoreSelection
-    ? { ...input.pressed, selection: input.restoreSelection(input.pressed.selection) }
-    : input.pressed;
+  const selection = input.restoreSelection
+    ? input.restoreSelection(input.pressed.selection)
+    : input.pressed.selection;
+  if (
+    !input.current ||
+    (!input.current.selection.options?.some((option) => option.id === "agent") &&
+      !selection.options?.some((option) => option.id === "agent"))
+  )
+    return { ...input.pressed, selection };
+  const carriedOptions = carryProviderAgentSelection({
+    targetSelections: selection.options,
+    currentSelections: input.current.selection.options,
+  });
+  const options = input.pressed.capabilities
+    ? buildExplicitProviderOptionSelectionsFromDescriptors(
+        getProviderOptionDescriptors({
+          caps: input.pressed.capabilities,
+          selections: carriedOptions,
+        }),
+        carriedOptions,
+      )
+    : carriedOptions;
+  return { ...input.pressed, selection: { ...selection, options } };
 }
 
 export function canCommitPendingModel(

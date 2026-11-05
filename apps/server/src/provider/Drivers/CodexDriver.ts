@@ -1,3 +1,7 @@
+import {
+  loadCodexManagementRoles,
+  withCodexManagementRoleOptions,
+} from "../CodexManagementRoles.ts";
 import { CodexSettings, ProviderDriverKind } from "@t3tools/contracts";
 import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -298,7 +302,18 @@ export const CodexDriver: ProviderDriver<
               Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
             ),
           ]).pipe(
-            Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })),
+            Effect.flatMap(([machineSnapshot, skills]) =>
+              loadCodexManagementRoles({
+                homePath: effectiveConfig.homePath,
+                environment: processEnv,
+              }).pipe(
+                Effect.map((roles) => ({
+                  ...machineSnapshot,
+                  skills,
+                  models: withCodexManagementRoleOptions(machineSnapshot.models, roles),
+                })),
+              ),
+            ),
             Effect.mapError(
               (cause) =>
                 new ProviderDriverError({
@@ -308,6 +323,8 @@ export const CodexDriver: ProviderDriver<
                   cause,
                 }),
             ),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, pathService),
           );
 
     // Redemption spends account credit; serialize by the auth.json directory, keep one idempotency key

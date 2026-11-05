@@ -1,4 +1,5 @@
 import type { ProviderOptionSelection } from "@t3tools/contracts";
+import { carryProviderAgentSelection } from "@t3tools/shared/model";
 import { appAtomRegistry } from "./atom-registry";
 import {
   modelOptionMemoryAtom,
@@ -73,5 +74,9 @@ export function withRememberedModelOptions<
   ) {
     return selection;
   }
-  return { ...selection, options: remembered };
+  const options = carryProviderAgentSelection({
+    targetSelections: remembered,
+    currentSelections: selection.options,
+  });
+  return { ...selection, options };
 }

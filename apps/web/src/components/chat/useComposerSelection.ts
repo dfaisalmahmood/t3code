@@ -19,7 +19,18 @@ import { useNavigate } from "@tanstack/react-router";
 import { toastManager } from "../ui/toast";
 import { resolveAppModelSelectionForInstance } from "../../modelSelection";
 import { resolveNewDraftStartFromOrigin } from "../../lib/chatThreadActions";
-import { type DraftThreadEnvMode, useComposerDraftStore } from "../../composerDraftStore";
+import {
+  type DraftThreadEnvMode,
+  deriveEffectiveComposerModelState,
+  useComposerDraftModelState,
+  useComposerDraftStore,
+} from "../../composerDraftStore";
+import {
+  buildExplicitProviderOptionSelectionsFromDescriptors,
+  carryProviderAgentSelection,
+  getProviderOptionDescriptors,
+  resolveProviderForCwd,
+} from "@t3tools/shared/model";
 import {
   getStartedThreadModelChangeBlockReason,
   deriveLockedProvider,
@@ -36,6 +47,7 @@ interface ComposerSelectionInput {
   };
   readonly settings: UnifiedSettings;
   readonly providerStatuses: ReadonlyArray<ServerProvider>;
+  readonly cwd: string | null;
   readonly lockedProvider: ReturnType<typeof deriveLockedProvider>;
   readonly supportsProviderSwitchingViaHandoff: boolean;
   readonly multipleModelSelections: ReadonlyArray<ModelSelection> | null;
@@ -67,6 +79,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     activeProjectSettings,
     settings,
     providerStatuses,
+    cwd,
     lockedProvider,
     supportsProviderSwitchingViaHandoff,
     multipleModelSelections,
@@ -80,6 +93,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     scheduleComposerFocus,
   } = input;
   const navigate = useNavigate();
+  const draftModelState = useComposerDraftModelState(composerDraftTarget);
   const setStickyComposerModelSelection = useComposerDraftStore(
     (store) => store.setStickyModelSelection,
   );
@@ -145,8 +159,12 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     options?: { focusComposer?: boolean },
   ) => {
     if (!activeThread) return;
-    const entry = providerStatuses.find((snapshot) => snapshot.instanceId === instanceId);
-    const resolvedDriverKind = entry?.driver ?? null;
+    const scopedProviders = providerStatuses.map((provider) =>
+      resolveProviderForCwd(provider, cwd),
+    );
+    const entry = scopedProviders.find((snapshot) => snapshot.instanceId === instanceId);
+    if (!entry) return;
+    const resolvedDriverKind = entry.driver;
     if (
       !supportsProviderSwitchingViaHandoff &&
       lockedProvider !== null &&
@@ -176,7 +194,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     const resolvedModel = resolveAppModelSelectionForInstance(
       instanceId,
       settings,
-      providerStatuses,
+      scopedProviders,
       model,
     );
     if (!resolvedModel) {
@@ -185,10 +203,30 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     }
     const rememberedOptions =
       useComposerDraftStore.getState().stickyOptionsByModelByProvider[instanceId]?.[resolvedModel];
-    const nextModelSelection: ModelSelection =
-      rememberedOptions !== undefined && rememberedOptions.length > 0
-        ? { instanceId, model: resolvedModel, options: [...rememberedOptions] }
-        : { instanceId, model: resolvedModel };
+    const currentOptions = deriveEffectiveComposerModelState({
+      draft: draftModelState,
+      providers: scopedProviders,
+      selectedProvider: entry.driver,
+      selectedInstanceId: instanceId,
+      threadModelSelection: activeThread.modelSelection,
+      projectModelSelection: null,
+      settings,
+    }).modelOptions?.[instanceId];
+    const carriedOptions = carryProviderAgentSelection({
+      targetSelections: rememberedOptions,
+      currentSelections: currentOptions,
+    });
+    const nextOptions = buildExplicitProviderOptionSelectionsFromDescriptors(
+      getProviderOptionDescriptors({
+        caps:
+          entry?.models.find((candidate) => candidate.slug === resolvedModel)?.capabilities ?? {},
+        selections: carriedOptions,
+      }),
+      carriedOptions,
+    );
+    const nextModelSelection: ModelSelection = nextOptions
+      ? { instanceId, model: resolvedModel, options: nextOptions }
+      : { instanceId, model: resolvedModel };
     const modelChangeBlockReason = getStartedThreadModelChangeBlockReason({
       hasStartedSession: activeRuntime !== null,
       supportsProviderSwitchingViaHandoff,
@@ -210,7 +248,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
       nextModelSelection,
       { explicit: true, replaceOptions: true },
     );
-    setStickyComposerModelSelection(nextModelSelection);
+    setStickyComposerModelSelection(nextModelSelection, { replaceOptions: true });
     if (options?.focusComposer !== false) scheduleComposerFocus();
   };
   const onProviderModelSelectStable = useStableCallback(onProviderModelSelect);

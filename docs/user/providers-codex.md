@@ -76,6 +76,31 @@ reported accounts, refresh provider status, and confirm the second instance has
 its own shadow path and login. A shadow-home conflict usually means the directory
 contains a copied Codex setup. Use a fresh shadow directory and sign in again.
 
+## Use an installed management role
+
+Select a role under **Agent** in the model options. Reasoning remains a separate
+choice. Roles come from matching installed Codex profiles and OpenCode permission
+companions on the connected environment. An incomplete or unsupported profile is
+unavailable.
+
+The role keeps its permission limit even in Full Access mode. Codex management
+roles cannot run shell commands, edit files, spawn native children, use browser
+or computer tools, or call third-party tools. Owen's shell approval requests are
+also unavailable. Explicit T3 tool grants can still dispatch workers with their
+own permissions. Delegation inherits the Agent when it inherits model options.
+Choose **Default** explicitly for a coding worker; keep its reasoning and service
+tier choices separately. Use OpenCode when you need the companion policy's full behavior.
+
+Changing the role or selecting **Default** starts a fresh native context with a
+conversation handoff. If either installed profile changes, select the updated
+role before continuing. An unavailable selection never silently becomes Default.
+
+A bare OpenCode Agent can carry to an available, revision-pinned Codex profile.
+Codex revisions cannot be attested by OpenCode's bare Agent names. Switching back
+keeps that selection unavailable until you explicitly choose the target Agent.
+Clearing a stale role with **Default**, or choosing a current replacement, starts
+a fresh context without requiring the old profile files.
+
 ## Answer questions while Codex works
 
 Codex can ask a question and keep working. Answer it in the thread's question

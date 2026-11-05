@@ -111,8 +111,12 @@ it.live.each(
           config: decodeSettings({ setupMode: "managed", homePath: sharedHome }),
           environment: ambient,
         });
+        assert.equal(leases, 0);
+        assert.equal(runtime.managementRoleSource.homePath, runtime.homePath);
+        assert.equal(runtime.managementRoleSource.environment.CODEX_HOME, runtime.homePath);
         yield* Effect.gen(function* () {
           const effective = yield* runtime.resolve;
+          assert.equal(effective.config.homePath, runtime.managementRoleSource.homePath);
           assert.strictEqual(leases, 1);
           assert.strictEqual(effective.config.binaryPath, executable.executablePath);
           assert.notStrictEqual(effective.config.homePath, ambient.CODEX_HOME);

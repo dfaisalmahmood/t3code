@@ -58,6 +58,10 @@ export const makeCodexManagedRuntime = Effect.fn("makeCodexManagedRuntime")(func
     options.config,
   );
   const homePath = homeLayout.effectiveHomePath ?? homeLayout.sharedHomePath;
+  const managementRoleSource = {
+    homePath,
+    environment: { ...options.environment, CODEX_HOME: homePath },
+  };
   const resolve = Effect.gen(function* () {
     // Establish renewal availability before auth.access can consume a refresh token.
     const endpoint = yield* broker.endpoint.pipe(
@@ -115,8 +119,7 @@ export const makeCodexManagedRuntime = Effect.fn("makeCodexManagedRuntime")(func
     );
     // Ambient CLI overrides cannot redirect a T3-owned token to a different provider.
     const environment: NodeJS.ProcessEnv = {
-      ...options.environment,
-      CODEX_HOME: homePath,
+      ...managementRoleSource.environment,
     };
     delete environment.ACCESS_TOKEN;
     delete environment.T3CODE_CODEX_LAUNCH_ARGS;
@@ -134,5 +137,5 @@ export const makeCodexManagedRuntime = Effect.fn("makeCodexManagedRuntime")(func
       revision: profileKey,
     } satisfies CodexEffectiveRuntime;
   });
-  return { auth, resolve, installation, homePath, homeLayout };
+  return { auth, resolve, installation, homePath, homeLayout, managementRoleSource };
 });

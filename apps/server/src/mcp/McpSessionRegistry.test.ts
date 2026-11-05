@@ -8,6 +8,7 @@ import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
@@ -225,4 +226,26 @@ it.effect.each(["provider-session", "thread", "all"] as const)(
       yield* registry.touch(threadId);
       expect(yield* registry.resolve(token)).toBeUndefined();
     }),
+);
+
+it.effect("pins token tool ceilings and never revives broader authority after replacement", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1000);
+    const sessions = yield* McpProviderSessions.McpProviderSessions;
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("role-thread"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.slice(7);
+    yield* sessions.set({ ...issued.config, allowedToolNames: ["t3_thread_read"] });
+    expect((yield* registry.resolve(token))?.allowedToolNames).toEqual(["t3_thread_read"]);
+    yield* sessions.set({
+      ...issued.config,
+      allowedToolNames: ["t3_thread_read", "t3_terminal_run"],
+    });
+    expect((yield* registry.resolve(token))?.allowedToolNames).toEqual(["t3_thread_read"]);
+    yield* sessions.set({ ...issued.config, providerSessionId: "replacement" });
+    yield* registry.touch(issued.config.threadId);
+    expect((yield* registry.resolve(token))?.allowedToolNames).toEqual([]);
+  }).pipe(Effect.provide(McpProviderSessions.layer)),
 );

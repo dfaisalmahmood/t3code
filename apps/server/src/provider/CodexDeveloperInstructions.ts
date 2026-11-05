@@ -41,14 +41,35 @@ export interface CodexRuntimeInfo {
 export function buildCodexAdditionalContext(
   runtime: CodexRuntimeInfo,
   toolsAvailable: boolean | T3CodeToolAvailability = true,
+  roleInstructions?: string,
 ): Record<string, V2TurnStartParams__AdditionalContextEntry> {
   const tools = toolInstructions(toolsAvailable);
+  const chunks: string[] = [];
+  let chunk = "";
+  let bytes = 0;
+  for (const character of roleInstructions ?? "") {
+    const size = Buffer.byteLength(character, "utf8");
+    if (bytes + size > CODEX_ADDITIONAL_CONTEXT_VALUE_MAX_BYTES) {
+      chunks.push(chunk);
+      chunk = "";
+      bytes = 0;
+    }
+    chunk += character;
+    bytes += size;
+  }
+  if (chunk) chunks.push(chunk);
   // Split values to fit per-entry caps; number keys because Codex emits them in key order.
   return {
     ...Object.fromEntries(
       T3_CODE_ORCHESTRATION_SECTIONS.map((section, index) => [
         `t3_code_orchestration_${String(index + 1).padStart(2, "0")}`,
         { kind: "application" as const, value: section },
+      ]),
+    ),
+    ...Object.fromEntries(
+      chunks.map((value, index) => [
+        `t3_code_role_${String(index + 1).padStart(3, "0")}`,
+        { kind: "application" as const, value },
       ]),
     ),
     t3_code_runtime: {

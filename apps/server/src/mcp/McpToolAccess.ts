@@ -8,6 +8,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Ref from "effect/Ref";
@@ -403,6 +404,42 @@ const routed = Effect.fn("McpToolAccess.routed")(function* <Tools extends Record
         yield* (remote as RemoteCheck<typeof params>)(params);
         if (Option.isNone(forwarding)) return yield* linksUnavailable;
         return yield* forwarding.value.call(scope, tool, target, { ...params, environmentId });
+      });
+  }
+  const providerSessions = yield* Effect.serviceOption(McpProviderSessions.McpProviderSessions);
+  for (const name of Object.keys(handlers)) {
+    const handle = handlers[name] as (
+      params: object,
+    ) => Effect.Effect<unknown, Tool.Failure<Tools[keyof Tools]>>;
+    handlers[name] = (params: object) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        const session =
+          scope.thread && Option.isSome(providerSessions)
+            ? yield* providerSessions.value.read(scope.thread.threadId)
+            : undefined;
+        if (
+          scope.providerCredential === true &&
+          session?.providerSessionId !== scope.requestNamespace
+        )
+          return yield* new OrchestratorMcpFailure({
+            code: "capability_denied",
+            message: "This agent credential no longer belongs to the active provider session.",
+          });
+        if (scope.allowedToolNames !== undefined || session?.allowedToolNames !== undefined) {
+          if (
+            !scope.thread ||
+            session?.providerSessionId !== scope.requestNamespace ||
+            !session.allowedToolNames?.includes(name) ||
+            (scope.allowedToolNames !== undefined && !scope.allowedToolNames.includes(name))
+          ) {
+            return yield* new OrchestratorMcpFailure({
+              code: "capability_denied",
+              message: "This tool is outside the pinned agent permission profile.",
+            });
+          }
+        }
+        return yield* handle(params);
       });
   }
   return handlers as Toolkit.HandlersFrom<Tools>;

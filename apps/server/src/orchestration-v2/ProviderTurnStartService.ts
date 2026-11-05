@@ -50,6 +50,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import {
   ContextHandoffBackgroundWorkError,
   knownProviderFailureMessage,
@@ -143,6 +144,7 @@ export const layer: Layer.Layer<
   | ProviderAuthService.ProviderAuthService
   | ProjectionStore.ProjectionStoreV2
   | ProviderSessionManager.ProviderSessionManagerV2
+  | ProviderAdapterRegistry.ProviderAdapterRegistryV2
   | RunExecutionService.RunExecutionServiceV2
   | RuntimePolicy.RuntimePolicyV2
 > = Layer.effect(
@@ -159,6 +161,7 @@ export const layer: Layer.Layer<
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
@@ -1149,7 +1152,24 @@ export const layer: Layer.Layer<
           const sourceBusy = sourceProjection.runs.some(
             (candidate) => candidate.ordinal > sourceRun.ordinal && isActiveRun(candidate),
           );
-          if (!sourceBusy) {
+          const sourceCapabilities = yield* providerAdapters
+            .get(sourceRun.providerInstanceId)
+            .pipe(
+              Effect.flatMap((sourceAdapter) =>
+                sourceAdapter.getCapabilities(sourceRun.modelSelection),
+              ),
+            );
+          const targetCapabilities = yield* providerAdapters
+            .get(run.providerInstanceId)
+            .pipe(
+              Effect.flatMap((targetAdapter) => targetAdapter.getCapabilities(run.modelSelection)),
+            );
+          const canForkNatively =
+            sourceCapabilities.threads.canForkThread &&
+            sourceCapabilities.threads.canForkFromTurn &&
+            targetCapabilities.threads.canForkThread &&
+            targetCapabilities.threads.canForkFromTurn;
+          if (!sourceBusy && canForkNatively) {
             // Rolled-back turns are no longer in the source conversation, so they cannot bound a fork.
             const rolledBackAttemptIds = new Set(
               sourceProjection.attempts
@@ -1207,7 +1227,12 @@ export const layer: Layer.Layer<
               modelSelection: run.modelSelection,
               runtimePolicy: resolvedRuntimePolicy,
               providerSessionId,
-              existingProviderThread: { ...providerThread, forkedFrom: null },
+              existingProviderThread: {
+                ...providerThread,
+                nativeThreadRef: null,
+                nativeConversationHeadRef: null,
+                forkedFrom: null,
+              },
             }),
           );
           if (loaded === undefined) return undefined;

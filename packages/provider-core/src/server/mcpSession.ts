@@ -11,6 +11,7 @@ export interface McpProviderSessionConfig {
   readonly browserToolsAvailable: boolean;
   readonly capabilities?: ReadonlySet<string>;
   readonly toolNames?: ReadonlyArray<string>;
+  readonly allowedToolNames?: ReadonlyArray<string>;
   readonly agentDeviceEnvironment?: Readonly<Record<string, string>>;
 }
 

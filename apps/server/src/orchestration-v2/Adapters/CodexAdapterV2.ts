@@ -74,6 +74,7 @@ import type {
   ProviderThreadId,
   ProviderTurnId,
   ProviderInstanceId,
+  ProviderSessionId,
   RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
@@ -141,7 +142,15 @@ import {
   makeProviderFailureTurnItem,
   makeProviderRetryTurnItem,
 } from "@t3tools/provider-core/server/failure";
-import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
+import {
+  codexManagementRoleId,
+  codexManagementRoleConfig,
+  codexManagementMcpIsolation,
+  verifyCodexManagementRuntimeConfig,
+  loadCodexManagementRoles,
+  CodexManagementRoleError,
+  type CodexManagementRole,
+} from "../../provider/CodexManagementRoles.ts";
 import {
   isProviderNativeImageAttachment,
   providerMessageTextWithAttachmentPaths,
@@ -696,6 +705,8 @@ type CodexTurnStartParamsWithCollaborationMode =
 const decodeCodexTurnStartParamsWithCollaborationMode = Schema.decodeUnknownEffect(
   CodexTurnStartParamsWithCollaborationMode,
 );
+const isProviderAdapterProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
+
 const isProviderAdapterRuntimeRequestResponseError = Schema.is(
   ProviderAdapter.ProviderAdapterRuntimeRequestResponseError,
 );
@@ -747,6 +758,7 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     readonly codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>;
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     readonly modelSelection: ModelSelection;
+    readonly role?: CodexManagementRole;
     readonly hasT3Mcp?: boolean;
     readonly browserToolsAvailable?: boolean;
     readonly deviceToolsAvailable?: boolean;
@@ -755,12 +767,14 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
   }) {
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
-    const approvalPolicy =
-      input.runtimePolicy.approvalPolicy === undefined
+    const approvalPolicy = input.role
+      ? "never"
+      : input.runtimePolicy.approvalPolicy === undefined
         ? runtimeModeDefaults.approvalPolicy
         : yield* decodeTurnApprovalPolicy(input.runtimePolicy.approvalPolicy);
-    const sandboxPolicy =
-      input.runtimePolicy.sandboxPolicy === undefined
+    const sandboxPolicy = input.role
+      ? { type: "readOnly" as const, networkAccess: false }
+      : input.runtimePolicy.sandboxPolicy === undefined
         ? runtimeModeDefaults.sandboxPolicy
         : yield* decodeTurnSandboxPolicy(input.runtimePolicy.sandboxPolicy);
     const selectedEffort =
@@ -780,19 +794,20 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
       ]),
     );
     const t3Context =
-      input.hasT3Mcp === true
+      input.hasT3Mcp === true || input.role !== undefined
         ? buildCodexAdditionalContext(
             { model: input.modelSelection.model, reasoningEffort: effort ?? undefined },
             {
-              browser: input.browserToolsAvailable ?? true,
-              device: input.deviceToolsAvailable ?? false,
+              browser: !input.role && (input.browserToolsAvailable ?? true),
+              device: !input.role && (input.deviceToolsAvailable ?? false),
             },
+            input.role?.instructions,
           )
         : undefined;
     const additionalContext =
       t3Context === undefined && Object.keys(appContext).length === 0
         ? undefined
-        : { ...t3Context, ...appContext };
+        : { ...appContext, ...t3Context };
     return yield* decodeCodexTurnStartParamsWithCollaborationMode({
       threadId: input.nativeThreadId,
       input: input.codexInput,
@@ -802,7 +817,7 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
       // Catalogues can default summaries to "none"; request them explicitly on every turn.
       summary: "detailed",
       // Omitting the reviewer on resume preserves the previous Auto reviewer.
-      approvalsReviewer: runtimeModeDefaults.approvalsReviewer,
+      approvalsReviewer: input.role ? "user" : runtimeModeDefaults.approvalsReviewer,
       ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
       ...(sandboxPolicy === undefined ? {} : { sandboxPolicy }),
       ...(effort === undefined ? {} : { effort }),
@@ -819,11 +834,29 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
   },
 );
 
+const codexSessionCapabilities = (selection?: ModelSelection) =>
+  selection && codexManagementRoleId(selection) !== undefined
+    ? {
+        ...CodexProviderCapabilitiesV2,
+        sessions: {
+          ...CodexProviderCapabilitiesV2.sessions,
+          supportsMultipleProviderThreadsPerSession: false,
+        },
+        threads: {
+          ...CodexProviderCapabilitiesV2.threads,
+          canForkThread: false,
+          canForkFromTurn: false,
+          canForkFromSubagentThread: false,
+        },
+      }
+    : CodexProviderCapabilitiesV2;
+
 function providerSession(input: {
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
   readonly providerInstanceId: ProviderInstanceId;
   readonly cwd: string | null;
   readonly model: string;
+  readonly modelSelection: ModelSelection;
   readonly now: DateTime.Utc;
 }): OrchestrationV2ProviderSession {
   return {
@@ -833,7 +866,7 @@ function providerSession(input: {
     status: "ready",
     cwd: input.cwd ?? process.cwd(),
     model: input.model,
-    capabilities: CodexProviderCapabilitiesV2,
+    capabilities: codexSessionCapabilities(input.modelSelection),
     createdAt: input.now,
     updatedAt: input.now,
     lastError: null,
@@ -1340,6 +1373,7 @@ export interface CodexAppServerClientFactoryShape {
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     readonly settings: CodexSettings;
     readonly environment: NodeJS.ProcessEnv;
+    readonly roleConfig?: Readonly<Record<string, Schema.Json>>;
   }) => Effect.Effect<
     CodexClient.CodexAppServerClient["Service"],
     ProviderAdapter.ProviderAdapterOpenSessionError,
@@ -1369,11 +1403,17 @@ function codexThreadRuntimeParams(input: {
   readonly threadId: ThreadId | null;
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
   readonly modelSelection?: { readonly model: string };
+  readonly role?: CodexManagementRole;
+  readonly mcpIsolationConfig?: Readonly<Record<string, Schema.Json>>;
   readonly runtimePolicy?: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
 }): {
   readonly cwd?: string;
   readonly model?: string;
   readonly config: Readonly<Record<string, Schema.Json>>;
+  readonly developerInstructions?: string;
+  readonly approvalPolicy?: "never";
+  readonly approvalsReviewer?: "user";
+  readonly sandbox?: "read-only";
 } {
   const { mcpSession } = input;
   const t3Server =
@@ -1384,11 +1424,27 @@ function codexThreadRuntimeParams(input: {
           tool_timeout_sec: CODEX_T3_MCP_TOOL_TIMEOUT_SEC,
           http_headers: { Authorization: mcpSession.authorizationHeader },
         };
+  const allowedTools =
+    input.role?.allowedTools.filter(
+      (name) =>
+        mcpSession?.toolNames?.includes(name) &&
+        (mcpSession.allowedToolNames === undefined || mcpSession.allowedToolNames.includes(name)),
+    ) ?? [];
   return {
     ...(input.runtimePolicy?.cwd == null ? {} : { cwd: input.runtimePolicy.cwd }),
     ...(input.modelSelection === undefined ? {} : { model: input.modelSelection.model }),
+    ...(input.role
+      ? {
+          developerInstructions: input.role.instructions,
+          approvalPolicy: "never" as const,
+          approvalsReviewer: "user" as const,
+          sandbox: "read-only" as const,
+        }
+      : {}),
     config: {
       ...CODEX_THREAD_CONFIG,
+      ...(input.role ? codexManagementRoleConfig(input.role) : {}),
+      ...input.mcpIsolationConfig,
       // One app-server serves many threads, so the id goes in per-thread shell config, not its env.
       ...(input.threadId === null
         ? {}
@@ -1397,18 +1453,38 @@ function codexThreadRuntimeParams(input: {
         ? {}
         : {
             // Override only T3's servers so launch-argument MCP servers survive.
-            "mcp_servers.t3-code": { ...t3Server, disabled_tools: [CODEX_DIRECT_ONLY_T3_TOOL] },
+            "mcp_servers.t3-code": {
+              ...t3Server,
+              ...(input.role
+                ? {
+                    enabled_tools: allowedTools,
+                    tools: Object.fromEntries(
+                      allowedTools.map((name) => [name, { approval_mode: "approve" }]),
+                    ),
+                  }
+                : { disabled_tools: [CODEX_DIRECT_ONLY_T3_TOOL] }),
+            },
             // Code Mode runs a blocking wait as a nested call, and the model keeps working
             // around it. A second, direct-only registration makes it a plain tool call.
             [`mcp_servers.${CODEX_T3_DIRECT_MCP_SERVER}`]: {
               ...t3Server,
-              enabled_tools: [CODEX_DIRECT_ONLY_T3_TOOL],
+              enabled_tools: input.role ? [] : [CODEX_DIRECT_ONLY_T3_TOOL],
               omit_tools_from: ["code_mode", "deferred"],
             },
           }),
     },
   };
 }
+
+const decodeCodexRoleResumePolicy = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    approvalPolicy: Schema.Literal("never"),
+    sandbox: Schema.Struct({
+      type: Schema.Literal("readOnly"),
+      networkAccess: Schema.optional(Schema.Literal(false)),
+    }),
+  }),
+);
 
 const decodeCodexResumeMetadata = Schema.decodeUnknownEffect(
   Schema.Struct({ thread: Schema.Struct({ id: Schema.String, updatedAt: Schema.Number }) }),
@@ -1523,7 +1599,9 @@ function redactCodexProtocolValue(value: unknown): unknown {
   return Object.fromEntries(
     Object.entries(value).map(([key, nested]) => [
       key,
-      isSensitiveCodexProtocolKey(key) ? "[REDACTED]" : redactCodexProtocolValue(nested),
+      key === "config" || key === "layers" || isSensitiveCodexProtocolKey(key)
+        ? "[REDACTED]"
+        : redactCodexProtocolValue(nested),
     ]),
   );
 }
@@ -1559,9 +1637,20 @@ export const layerAppServerClientFactory: Layer.Layer<
         };
         const command = yield* makeCodexAppServerSpawnCommand({
           command: input.settings.binaryPath || "codex",
-          args: codexAppServerArgs(
-            resolveCodexLaunchArgs(input.settings.launchArgs, input.environment),
-          ),
+          args: [
+            ...codexAppServerArgs(
+              resolveCodexLaunchArgs(input.settings.launchArgs, input.environment),
+            ),
+            ...(input.roleConfig
+              ? [
+                  "--strict-config",
+                  ...Object.entries(input.roleConfig).flatMap(([key, value]) => [
+                    "-c",
+                    `${key}=${JSON.stringify(value)}`,
+                  ]),
+                ]
+              : []),
+          ],
           env: environment,
           threadId: input.threadId,
         }).pipe(Effect.provideService(AgentScope, agentScope));
@@ -1609,7 +1698,10 @@ export type CodexAdapterV2DriverEnv =
 
 export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapterV2")(function* (
   { instanceId, environment, enabled, config }: ProviderAdapterDriverCreateInput<CodexSettings>,
-  hooks: Pick<CodexAdapterV2Options, "onUsageLimits" | "resolveRuntime" | "compatibility"> = {},
+  hooks: Pick<
+    CodexAdapterV2Options,
+    "onUsageLimits" | "resolveRuntime" | "compatibility" | "managementRoleSource"
+  > = {},
 ) {
   const clientFactory = yield* CodexAppServerClientFactory;
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
@@ -1660,6 +1752,10 @@ export interface CodexAdapterV2Options {
   readonly clientFactory: CodexAppServerClientFactoryShape;
   readonly onUsageLimits?: ManagedServerProvider["applyUsageLimits"];
   readonly resolveRuntime?: Effect.Effect<CodexEffectiveRuntime, ProviderSetupError, Scope.Scope>;
+  readonly managementRoleSource?: {
+    readonly homePath: string;
+    readonly environment: NodeJS.ProcessEnv;
+  };
   readonly compatibility?: (
     version: string,
   ) => Effect.Effect<ServerProviderCompatibilityAdvisory | undefined>;
@@ -1679,20 +1775,87 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
   adapterOptions: CodexAdapterV2Options,
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+  const rolePath = yield* Path.Path;
   const readMcpSession = (threadId: ThreadId | null) =>
     // @effect-diagnostics-next-line effectSucceedWithVoid:off - This optional result requires undefined, not the wider void type.
     threadId === null ? Effect.succeed(undefined) : mcpSessions.read(threadId);
   const { clientFactory, digest, fileSystem, idAllocator, serverConfig } = adapterOptions;
   const continuationRequests = adapterOptions.continuationRequests;
 
+  const transferFailure = (cause: unknown) =>
+    new ProviderAdapter.ProviderAdapterProtocolError({
+      driver: CODEX_PROVIDER,
+      detail:
+        "The source management profile cannot be verified for context transfer. Restore its pinned profile or explicitly select a replacement role for a fresh context.",
+      cause,
+    });
+  const transferValidators = new Map<
+    ProviderSessionId,
+    {
+      readonly roleId: string | undefined;
+      readonly verify: (
+        selection: ModelSelection | null,
+      ) => Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError>;
+    }
+  >();
+  const readTransferRoles = loadCodexManagementRoles(
+    adapterOptions.managementRoleSource ?? {
+      homePath: adapterOptions.settings.homePath,
+      environment: adapterOptions.environment,
+    },
+  ).pipe(
+    Effect.provideService(FileSystem.FileSystem, fileSystem),
+    Effect.provideService(Path.Path, rolePath),
+  );
+
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: adapterOptions.instanceId,
     driver: CODEX_PROVIDER,
-    getCapabilities: Effect.fn("CodexAdapterV2.getCapabilities")(function () {
-      return Effect.succeed(CodexProviderCapabilitiesV2);
+    getCapabilities: Effect.fn("CodexAdapterV2.getCapabilities")(function (
+      selection?: ModelSelection,
+    ) {
+      return Effect.succeed(codexSessionCapabilities(selection));
     }),
-    planSelectionTransition: Effect.fn("CodexAdapterV2.planSelectionTransition")(function () {
-      return Effect.succeed(turnScopedSelectionTransition());
+    validateContextTransfer: Effect.fn("CodexAdapterV2.validateContextTransfer")(
+      function* ({ providerSessionId, modelSelection, targetModelSelection, targetDriver }) {
+        const targetRoleId = codexManagementRoleId(targetModelSelection);
+        if (targetDriver !== CODEX_PROVIDER && targetRoleId?.includes("@"))
+          return yield* new CodexManagementRoleError({ reason: "unsupported-runtime" });
+        const pinned =
+          providerSessionId === null ? undefined : transferValidators.get(providerSessionId);
+        const sourceRoleId = pinned
+          ? pinned.roleId
+          : modelSelection === null
+            ? null
+            : codexManagementRoleId(modelSelection);
+        if (sourceRoleId === null || sourceRoleId !== targetRoleId) {
+          if (
+            targetDriver === CODEX_PROVIDER &&
+            targetRoleId !== undefined &&
+            targetModelSelection.instanceId === adapterOptions.instanceId &&
+            !(yield* readTransferRoles).some((role) => role.selectionId === targetRoleId)
+          )
+            return yield* new CodexManagementRoleError({ reason: "missing-profile" });
+          return { requiresFreshProviderThread: true };
+        }
+        if (pinned) yield* pinned.verify(modelSelection);
+        else if (
+          sourceRoleId !== undefined &&
+          !(yield* readTransferRoles).some((role) => role.selectionId === sourceRoleId)
+        )
+          return yield* new CodexManagementRoleError({ reason: "changed-profile" });
+        return { requiresFreshProviderThread: false };
+      },
+      Effect.mapError((cause) =>
+        isProviderAdapterProtocolError(cause) ? cause : transferFailure(cause),
+      ),
+    ),
+    planSelectionTransition: Effect.fn("CodexAdapterV2.planSelectionTransition")(function (input) {
+      return Effect.succeed(
+        codexManagementRoleId(input.current) === codexManagementRoleId(input.target)
+          ? { type: "apply_on_next_turn" as const }
+          : { type: "create_with_handoff" as const },
+      );
     }),
     openSession: Effect.fn("CodexAdapterV2.openSession")(
       function* (input) {
@@ -1710,14 +1873,68 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                 ),
               );
+        const roleSettings = resolvedRuntime?.config ?? adapterOptions.settings;
+        const roleEnvironment = resolvedRuntime?.environment ?? adapterOptions.environment;
+        const readRoles = loadCodexManagementRoles({
+          homePath: roleSettings.homePath,
+          environment: roleEnvironment,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, rolePath),
+        );
+        const selectedRoleId = codexManagementRoleId(input.modelSelection);
+        const role =
+          selectedRoleId === undefined
+            ? undefined
+            : (yield* readRoles).find((entry) => entry.selectionId === selectedRoleId);
+        if (selectedRoleId !== undefined && role === undefined)
+          return yield* new ProviderAdapter.ProviderAdapterOpenSessionError({
+            driver: CODEX_PROVIDER,
+            providerSessionId: input.providerSessionId,
+            cause: new CodexManagementRoleError({ reason: "missing-profile" }),
+          });
+        const verifyRole = Effect.fn("CodexAdapterV2.verifyRole")(function* (
+          selection: ModelSelection = input.modelSelection,
+        ) {
+          if (codexManagementRoleId(selection) !== selectedRoleId)
+            return yield* new CodexManagementRoleError({ reason: "changed-profile" });
+          if (
+            role &&
+            (yield* readRoles).find((entry) => entry.id === role.id)?.revision !== role.revision
+          )
+            return yield* new CodexManagementRoleError({ reason: "changed-profile" });
+        });
+        const readRoleMcpSession = Effect.fn("CodexAdapterV2.readRoleMcpSession")(function* (
+          threadId: ThreadId | null,
+        ) {
+          const session = yield* readMcpSession(threadId);
+          if (!role || !session) return session;
+          const allowedToolNames = role.allowedTools.filter(
+            (name) =>
+              session.toolNames?.includes(name) &&
+              (session.allowedToolNames === undefined || session.allowedToolNames.includes(name)),
+          );
+          const bounded = { ...session, allowedToolNames };
+          yield* mcpSessions.set(bounded);
+          return bounded;
+        });
         const client = yield* clientFactory.open({
           instanceId: adapterOptions.instanceId,
           threadId: input.threadId,
           providerSessionId: input.providerSessionId,
           runtimePolicy: input.runtimePolicy,
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
-          environment: resolvedRuntime?.environment ?? adapterOptions.environment,
+          environment: roleEnvironment,
+          ...(role
+            ? {
+                roleConfig: {
+                  ...codexManagementRoleConfig(role),
+                  developer_instructions: role.instructions,
+                },
+              }
+            : {}),
         });
+        const modelSelectionByNativeThread = new Map<string, ModelSelection>();
         const additionalContextByThread = yield* Ref.make(
           new Map<
             string,
@@ -1785,6 +2002,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }),
               );
             const version = userAgent && /\/(\S+)/u.exec(userAgent)?.[1];
+            if (role && version !== "0.166.0")
+              return yield* new CodexManagementRoleError({ reason: "unsupported-runtime" });
             const advisory =
               version && adapterOptions.compatibility
                 ? yield* adapterOptions.compatibility(version)
@@ -1803,13 +2022,108 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }),
         );
         // A failed open is discarded, so the next turn spawns the updated binary.
-        if (adapterOptions.compatibility !== undefined) yield* ensureInitialized;
+        if (adapterOptions.compatibility !== undefined || role) yield* ensureInitialized;
+        const foreignMcpServers = role
+          ? yield* client.raw
+              .request("config/read", {
+                includeLayers: true,
+                ...(input.runtimePolicy.cwd ? { cwd: input.runtimePolicy.cwd } : {}),
+              })
+              .pipe(
+                Effect.flatMap((response) =>
+                  Effect.try({
+                    try: () => codexManagementMcpIsolation(response),
+                    catch: (cause) =>
+                      new CodexManagementRoleError({ reason: "unsupported-runtime", cause }),
+                  }),
+                ),
+              )
+          : [];
+        const mcpIsolationConfig: Readonly<Record<string, Schema.Json>> = Object.fromEntries(
+          foreignMcpServers.map((name) => [`mcp_servers.${name}.enabled`, false]),
+        );
+        const verifyNativeRole = Effect.fn("CodexAdapterV2.verifyNativeRole")(function* (
+          cwd: string | null = input.runtimePolicy.cwd,
+          nativeThreadId?: string,
+        ) {
+          if (!role) return;
+          const effective = yield* client.raw.request("config/read", {
+            includeLayers: true,
+            ...(cwd ? { cwd } : {}),
+          });
+          const features: Array<{ readonly name: string; readonly enabled: boolean }> = [];
+          const featureNames = new Set<string>();
+          const featureCursors = new Set<string>();
+          let featureCursor: string | undefined;
+          do {
+            const page = yield* client.request("experimentalFeature/list", {
+              limit: 200,
+              ...(nativeThreadId ? { threadId: nativeThreadId } : {}),
+              ...(featureCursor ? { cursor: featureCursor } : {}),
+            });
+            for (const feature of page.data) {
+              if (featureNames.has(feature.name) || featureNames.size >= 4096)
+                return yield* new CodexManagementRoleError({ reason: "unsupported-runtime" });
+              featureNames.add(feature.name);
+              features.push(feature);
+            }
+            featureCursor = page.nextCursor ?? undefined;
+            if (featureCursor && (featureCursors.has(featureCursor) || featureCursors.size >= 64))
+              return yield* new CodexManagementRoleError({ reason: "unsupported-runtime" });
+            if (featureCursor) featureCursors.add(featureCursor);
+          } while (featureCursor);
+          yield* Effect.try({
+            try: () =>
+              verifyCodexManagementRuntimeConfig(effective, role, foreignMcpServers, features),
+            catch: (cause) =>
+              new CodexManagementRoleError({ reason: "unsupported-runtime", cause }),
+          });
+          if (nativeThreadId) {
+            let cursor: string | undefined;
+            do {
+              const inventory = yield* client.request("mcpServerStatus/list", {
+                threadId: nativeThreadId,
+                detail: "full",
+                ...(cursor ? { cursor } : {}),
+              });
+              for (const server of inventory.data) {
+                if (
+                  foreignMcpServers.includes(server.name) &&
+                  Object.keys(server.tools).length === 0
+                )
+                  continue;
+                if (
+                  (server.name !== "t3-code" && server.name !== "t3-code-direct") ||
+                  Object.values(server.tools).some(
+                    (tool) => server.name !== "t3-code" || !role.allowedTools.includes(tool.name),
+                  )
+                )
+                  return yield* new CodexManagementRoleError({ reason: "unsupported-runtime" });
+              }
+              cursor = inventory.nextCursor ?? undefined;
+            } while (cursor);
+          }
+        });
+        if (role) yield* verifyNativeRole();
+        const validateTransfer = {
+          roleId: selectedRoleId,
+          verify: (selection: ModelSelection | null) =>
+            verifyRole(selection ?? input.modelSelection).pipe(Effect.mapError(transferFailure)),
+        };
+        transferValidators.set(input.providerSessionId, validateTransfer);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (transferValidators.get(input.providerSessionId) === validateTransfer)
+              transferValidators.delete(input.providerSessionId);
+          }),
+        );
         const now = yield* DateTime.now;
         const session = providerSession({
           providerSessionId: input.providerSessionId,
           providerInstanceId: adapterOptions.instanceId,
           cwd: input.runtimePolicy.cwd,
           model: input.modelSelection.model,
+          modelSelection: input.modelSelection,
           now,
         });
         const events = yield* Queue.unbounded<
@@ -5276,6 +5590,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         yield* client.handleServerRequest("item/commandExecution/requestApproval", (payload) =>
           Effect.gen(function* () {
+            if (role)
+              return {
+                decision: "decline",
+              } satisfies CodexSchema.CommandExecutionRequestApprovalResponse;
             const context = yield* awaitActiveTurn(payload.turnId);
             if (context === undefined) {
               return yield* toProtocolError(
@@ -5347,6 +5665,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         yield* client.handleServerRequest("item/fileChange/requestApproval", (payload) =>
           Effect.gen(function* () {
+            if (role)
+              return {
+                decision: "decline",
+              } satisfies CodexSchema.FileChangeRequestApprovalResponse;
             const context = yield* awaitActiveTurn(payload.turnId);
             if (context === undefined) {
               return yield* toProtocolError(
@@ -5419,6 +5741,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         yield* client.handleServerRequest("item/permissions/requestApproval", (payload) =>
           Effect.gen(function* () {
+            if (role)
+              return {
+                permissions: {},
+                scope: "turn",
+              } satisfies CodexSchema.PermissionsRequestApprovalResponse;
             const context = yield* awaitActiveTurn(payload.turnId);
             if (context === undefined) {
               return yield* toProtocolError(
@@ -5480,6 +5807,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         yield* client.handleServerRequest("mcpServer/elicitation/request", (payload) =>
           Effect.gen(function* () {
+            if (role) return toMcpElicitationResponse(payload, "decline");
             if (toMcpElicitationResponse(payload, "accept").action !== "accept") {
               yield* Effect.logWarning("Declined an unsupported MCP elicitation.", {
                 serverName: payload.serverName,
@@ -5559,6 +5887,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         yield* client.handleServerRequest("execCommandApproval", (payload) =>
           Effect.gen(function* () {
+            if (role)
+              return {
+                decision: {
+                  denied: {
+                    rejection: "This agent permission profile does not permit command execution.",
+                  },
+                },
+              } satisfies CodexSchema.ExecCommandApprovalResponse;
             const context = yield* findActiveTurnByNativeThreadId(payload.conversationId);
             if (context === undefined) {
               return yield* toProtocolError(
@@ -5628,6 +5964,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         yield* client.handleServerRequest("applyPatchApproval", (payload) =>
           Effect.gen(function* () {
+            if (role)
+              return {
+                decision: {
+                  denied: {
+                    rejection: "This agent permission profile does not permit file writes.",
+                  },
+                },
+              } satisfies CodexSchema.ApplyPatchApprovalResponse;
             const context = yield* findActiveTurnByNativeThreadId(payload.conversationId);
             if (context === undefined) {
               return yield* toProtocolError(
@@ -6746,12 +7090,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>,
           ) {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
-            const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+            yield* verifyRole(turnInput.modelSelection);
+            yield* verifyNativeRole(turnInput.runtimePolicy.cwd, threadId);
+            const mcpSession = yield* readRoleMcpSession(turnInput.threadId);
             const turnStartParams = yield* buildCodexTurnStartParams({
               nativeThreadId: threadId,
               codexInput,
               runtimePolicy: turnInput.runtimePolicy,
               modelSelection: turnInput.modelSelection,
+              ...(role ? { role } : {}),
               hasT3Mcp: mcpSession !== undefined,
               browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
               deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
@@ -6776,6 +7123,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ...(yield* Ref.get(activeTurns)),
             ]);
             const started = yield* client.request("turn/start", turnStartParams);
+            modelSelectionByNativeThread.set(threadId, turnInput.modelSelection);
             const previousTurn =
               previousTurns.get(started.turn.id) ??
               (yield* Ref.get(activeTurns)).get(started.turn.id);
@@ -6962,6 +7310,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ),
           callTool: Effect.fn("CodexAdapterV2.callTool")(
             function* (callInput) {
+              if (
+                role &&
+                (callInput.server !== "t3-code" || !role.allowedTools.includes(callInput.tool))
+              )
+                return yield* new CodexManagementRoleError({ reason: "unsupported-runtime" });
               const threadId = yield* getNativeThreadId(callInput.providerThread);
               const response = yield* ensureInitialized.pipe(
                 Effect.andThen(
@@ -6986,6 +7339,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ),
           readResource: Effect.fn("CodexAdapterV2.readResource")(
             function* (readInput) {
+              if (role)
+                return yield* new CodexManagementRoleError({ reason: "unsupported-runtime" });
               const threadId = yield* getNativeThreadId(readInput.providerThread);
               const response = yield* ensureInitialized.pipe(
                 Effect.andThen(
@@ -7058,17 +7413,33 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }),
           ensureThread: (threadInput) =>
             ensureInitialized.pipe(
-              Effect.andThen(mcpSessions.read(threadInput.threadId)),
+              Effect.andThen(verifyRole(threadInput.modelSelection)),
+              Effect.andThen(verifyNativeRole(threadInput.runtimePolicy.cwd)),
+              Effect.andThen(readRoleMcpSession(threadInput.threadId)),
               Effect.flatMap((mcpSession) =>
                 client.request(
                   "thread/start",
                   codexThreadRuntimeParams({
                     threadId: threadInput.threadId,
+                    ...(role ? { role, mcpIsolationConfig } : {}),
                     mcpSession,
                     modelSelection: threadInput.modelSelection,
                     runtimePolicy: threadInput.runtimePolicy,
                   }),
                 ),
+              ),
+              Effect.tap((response) =>
+                Effect.sync(() =>
+                  modelSelectionByNativeThread.set(response.thread.id, threadInput.modelSelection),
+                ),
+              ),
+              Effect.tap((response) =>
+                role &&
+                (response.approvalPolicy !== "never" ||
+                  response.sandbox.type !== "readOnly" ||
+                  response.sandbox.networkAccess === true)
+                  ? Effect.fail(new CodexManagementRoleError({ reason: "unsupported-runtime" }))
+                  : Effect.void,
               ),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
@@ -7092,12 +7463,21 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           resumeThread: Effect.fn("CodexAdapterV2.resumeThread")(
             function* (threadInput) {
               const nativeThreadId = yield* getNativeThreadId(threadInput.providerThread);
+              const resumedSelection =
+                threadInput.modelSelection ??
+                (role
+                  ? (modelSelectionByNativeThread.get(nativeThreadId) ?? input.modelSelection)
+                  : undefined);
+              yield* verifyRole(resumedSelection);
+              yield* verifyNativeRole(threadInput.runtimePolicy?.cwd);
               const appThreadId = threadInput.threadId ?? threadInput.providerThread.appThreadId;
               const resume = resumeNativeThread(nativeThreadId, {
                 excludeTurns: true,
                 ...codexThreadRuntimeParams({
                   threadId: appThreadId,
-                  mcpSession: yield* readMcpSession(appThreadId),
+                  ...(resumedSelection ? { modelSelection: resumedSelection } : {}),
+                  ...(role ? { role, mcpIsolationConfig } : {}),
+                  mcpSession: yield* readRoleMcpSession(appThreadId),
                   ...(threadInput.modelSelection === undefined
                     ? {}
                     : { modelSelection: threadInput.modelSelection }),
@@ -7108,8 +7488,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               });
               const response = yield* ensureInitialized.pipe(
                 Effect.andThen(resume),
+                Effect.tap((response) =>
+                  role ? decodeCodexRoleResumePolicy(response) : Effect.void,
+                ),
                 Effect.flatMap(decodeCodexResumeMetadata),
               );
+              if (resumedSelection)
+                modelSelectionByNativeThread.set(nativeThreadId, resumedSelection);
               return {
                 ...threadInput.providerThread,
                 providerSessionId: input.providerSessionId,
@@ -7139,6 +7524,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ),
           compactThread: Effect.fn("CodexAdapterV2.compactThread")(
             function* (turnInput) {
+              yield* verifyRole(turnInput.modelSelection);
               const threadId = yield* getNativeThreadId(turnInput.providerThread);
               yield* Ref.update(pendingRootTurns, (current) =>
                 new Map(current).set(threadId, turnInput),
@@ -7222,6 +7608,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           },
           steerTurn: Effect.fn("CodexAdapterV2.steerTurn")(
             function* (turnInput) {
+              yield* verifyRole();
               const threadId = yield* getNativeThreadId(turnInput.providerThread);
               const latestTurnId = latestRunTurnId(turnInput.providerTurnId);
               const held = heldGoalTurn(turnInput.providerThread, latestTurnId);
@@ -7720,6 +8107,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ),
           respondToRuntimeRequest: Effect.fn("CodexAdapterV2.respondToRuntimeRequest")(
             function* (requestInput) {
+              if (role)
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_PROVIDER,
+                  detail:
+                    "Native approval responses are disabled by this agent permission profile.",
+                });
               const pending = (yield* Ref.get(pendingRuntimeRequests)).get(
                 String(requestInput.requestId),
               );
@@ -7865,7 +8258,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   excludeTurns: true,
                   ...codexThreadRuntimeParams({
                     threadId: threadInput.providerThread.appThreadId,
-                    mcpSession: yield* readMcpSession(threadInput.providerThread.appThreadId),
+                    mcpSession: yield* readRoleMcpSession(threadInput.providerThread.appThreadId),
+                    ...(role ? { role, mcpIsolationConfig } : {}),
                     modelSelection: input.modelSelection,
                     runtimePolicy: input.runtimePolicy,
                   }),
@@ -7907,6 +8301,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ),
           forkThread: Effect.fn("CodexAdapterV2.forkThread")(
             function* (threadInput) {
+              yield* verifyRole(threadInput.modelSelection);
               const threadId = yield* getNativeThreadId(threadInput.sourceProviderThread);
               const boundary = yield* resolveCodexForkBoundary(threadInput);
               const response = yield* ensureInitialized.pipe(
@@ -7918,7 +8313,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       : { lastTurnId: boundary.lastTurnId }),
                     ...codexThreadRuntimeParams({
                       threadId: threadInput.targetThreadId,
-                      mcpSession: yield* mcpSessions.read(threadInput.targetThreadId),
+                      mcpSession: yield* readRoleMcpSession(threadInput.targetThreadId),
+                      ...(role ? { role, mcpIsolationConfig } : {}),
                       ...(threadInput.modelSelection === undefined
                         ? {}
                         : { modelSelection: threadInput.modelSelection }),

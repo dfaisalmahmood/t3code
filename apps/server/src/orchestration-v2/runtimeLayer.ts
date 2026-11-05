@@ -164,6 +164,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
 const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
+      ProviderAdapterRegistry.layerFromProviderInstanceRegistry,
       layerContextHandoffServiceProvided,
       layerEventSink,
       IdAllocator.layer,

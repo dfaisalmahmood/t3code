@@ -109,6 +109,56 @@ describe("thread settings sheet state", () => {
     expect(pending?.selection).toEqual(withRememberedModelOptions(pressed.selection));
   });
 
+  it("keeps the carried Agent when restoring target model reasoning preferences", () => {
+    rememberModelOptions("codex", "gpt-other", [
+      { id: "agent", value: "warden" },
+      { id: "effort", value: "high" },
+      { id: "serviceTier", value: "priority" },
+    ]);
+    const pressed = modelOption("gpt-other", [{ id: "agent", value: "mason" }]);
+    const pending = pendingModelAfterPress({
+      current: null,
+      pressed,
+      pressedIsApplied: false,
+      restoreSelection: withRememberedModelOptions,
+    });
+    expect(pending?.selection.options).toEqual([
+      { id: "effort", value: "high" },
+      { id: "serviceTier", value: "priority" },
+      { id: "agent", value: "mason" },
+    ]);
+    expect(withRememberedModelOptions(modelOption("gpt-other").selection).options).toEqual([
+      { id: "effort", value: "high" },
+      { id: "serviceTier", value: "priority" },
+    ]);
+  });
+
+  it("carries an unsaved Agent edit when staging another model", () => {
+    const roleId = `mason@${"a".repeat(64)}`;
+    const pressed = {
+      ...modelOption("gpt-other"),
+      capabilities: {
+        optionDescriptors: [
+          {
+            id: "agent",
+            label: "Agent",
+            type: "select" as const,
+            options: [
+              { id: "default", label: "Default", isDefault: true },
+              { id: roleId, label: "Mason" },
+            ],
+          },
+        ],
+      },
+    };
+    const pending = pendingModelAfterPress({
+      current: modelOption("gpt-next", [{ id: "agent", value: "mason" }]),
+      pressed,
+      pressedIsApplied: false,
+    });
+    expect(pending?.selection.options).toEqual([{ id: "agent", value: roleId }]);
+  });
+
   it("keeps catalog defaults for scheduled-task picks even when options are remembered", () => {
     rememberModelOptions("codex", "gpt-other", [
       { id: "effort", value: "high" },

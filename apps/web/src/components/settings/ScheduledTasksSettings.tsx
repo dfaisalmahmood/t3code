@@ -91,6 +91,7 @@ import {
   matchesScheduledTaskScope,
   scheduleFromDraft,
   scheduledTaskDefaultModel,
+  scheduledTaskModelSelection,
   scheduledTaskProviders,
   taskToDraft,
   type DraftState,
@@ -1338,12 +1339,12 @@ function ScheduledTaskEditorForm({
       reportFailure("Checkout path is required", "Enter the path of the checkout to run in.");
       return;
     }
-    const modelSelection =
-      draft.baseModelSelection !== null &&
-      draft.baseModelSelection.instanceId === selection.instanceId &&
-      draft.baseModelSelection.model === selection.model
-        ? draft.baseModelSelection
-        : selection;
+    const modelSelection = scheduledTaskModelSelection({
+      currentSelection: draft.baseModelSelection,
+      effectiveSelection: activeSelection,
+      targetSelection: selection,
+      providers,
+    });
     const workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy =
       draft.workspaceMode === "root"
         ? { type: "root" }
@@ -1601,7 +1602,16 @@ function ScheduledTaskEditorForm({
                 isComposerOwned={false}
                 triggerClassName={SETTINGS_PICKER_TRIGGER_CLASSNAME}
                 onInstanceModelChange={(instanceId, model) =>
-                  setDraft((current) => ({ ...current, modelKey: `${instanceId}:${model}` }))
+                  setDraft((current) => ({
+                    ...current,
+                    modelKey: `${instanceId}:${model}`,
+                    baseModelSelection: scheduledTaskModelSelection({
+                      currentSelection: current.baseModelSelection,
+                      effectiveSelection: activeSelection,
+                      targetSelection: { instanceId, model },
+                      providers,
+                    }),
+                  }))
                 }
               />
             </div>

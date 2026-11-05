@@ -49,6 +49,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
@@ -70,6 +71,28 @@ const normalize = (target: string) => {
 const layerWorktreeLocation = (worktreesDir = managedWorktreesDir) =>
   Layer.mergeAll(
     Path.layer,
+    Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+      get: (instanceId) =>
+        Effect.succeed({
+          instanceId,
+          driver: ProviderDriverKind.make("codex"),
+          getCapabilities: (selection) =>
+            Effect.succeed(
+              selection?.options?.some((option) => option.id === "agent")
+                ? {
+                    ...CodexProviderCapabilitiesV2,
+                    threads: {
+                      ...CodexProviderCapabilitiesV2.threads,
+                      canForkThread: false,
+                      canForkFromTurn: false,
+                    },
+                  }
+                : CodexProviderCapabilitiesV2,
+            ),
+          planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+          openSession: () => Effect.die("This test registry only resolves capabilities"),
+        }),
+    }),
     Layer.mock(ServerConfig.ServerConfig)({ worktreesDir } as ServerConfig.ServerConfig["Service"]),
     ServerSettings.layerTest(),
   );
@@ -301,6 +324,9 @@ function makeLocalCommandHarness(input: {
     readonly contextRun: "current" | "failed" | "cancelled" | "delivered";
     readonly nativeForkFrom?: "idle" | "busy";
     readonly switchedProvider?: boolean;
+    readonly sourceRole?: string;
+    readonly targetRole?: string;
+    readonly missingSource?: boolean;
   };
 }) {
   const settledRuns: Array<string> = [];
@@ -321,7 +347,13 @@ function makeLocalCommandHarness(input: {
     threadId,
     ordinal: 2,
     providerInstanceId: newInstanceId,
-    modelSelection: { instanceId: newInstanceId, model: "gpt-5.4" },
+    modelSelection: {
+      instanceId: newInstanceId,
+      model: "gpt-5.4",
+      ...(input.sideChat?.targetRole === undefined
+        ? {}
+        : { options: [{ id: "agent", value: input.sideChat.targetRole }] }),
+    },
     providerThreadId,
     userMessageId: messageId,
     rootNodeId,
@@ -519,11 +551,22 @@ function makeLocalCommandHarness(input: {
   ];
   const parentRecords = {
     ...projection,
-    thread: { ...projection.thread, id: parentThreadId },
+    thread: {
+      ...projection.thread,
+      id: parentThreadId,
+      modelSelection: { instanceId: newInstanceId, model: "gpt-5.4" },
+    },
     runs: [
       {
         ...run,
         id: parentRunId,
+        modelSelection: {
+          instanceId: newInstanceId,
+          model: "gpt-5.4",
+          ...(input.sideChat?.sourceRole === undefined
+            ? {}
+            : { options: [{ id: "agent", value: input.sideChat.sourceRole }] }),
+        },
         threadId: parentThreadId,
         ordinal: 1,
         providerThreadId: parentProviderThread.id,
@@ -559,6 +602,7 @@ function makeLocalCommandHarness(input: {
     providerTurns: parentTurns.map(({ turn }) => turn),
     turnItems: [],
   };
+  if (input.sideChat?.missingSource === true) parentRecords.runs = [];
   if (input.sideChat !== undefined) {
     const earlierRunId = RunId.make("side-chat-earlier-run");
     projection = {
@@ -1295,25 +1339,62 @@ effectIt.effect.each([
 );
 
 effectIt.effect.each([
-  { nativeForkFrom: "idle", forks: true, transferStatus: "consumed", handoffIds: [] },
+  {
+    nativeForkFrom: "idle",
+    forks: true,
+    transferStatus: "consumed",
+    handoffIds: [],
+    sourceRole: undefined,
+    targetRole: undefined,
+  },
+  {
+    nativeForkFrom: "idle",
+    forks: false,
+    transferStatus: "resolved_portable",
+    handoffIds: ["side-chat-fork-context"],
+    sourceRole: "mason",
+    targetRole: undefined,
+  },
+  {
+    nativeForkFrom: "idle",
+    forks: false,
+    transferStatus: "resolved_portable",
+    handoffIds: ["side-chat-fork-context"],
+    sourceRole: undefined,
+    targetRole: "nolan",
+  },
+  {
+    nativeForkFrom: "idle",
+    forks: false,
+    transferStatus: "resolved_portable",
+    handoffIds: ["side-chat-fork-context"],
+    sourceRole: "mason",
+    targetRole: "nolan",
+  },
   {
     nativeForkFrom: "busy",
     forks: false,
     transferStatus: "resolved_portable",
     handoffIds: ["side-chat-fork-context"],
+    sourceRole: undefined,
+    targetRole: undefined,
   },
 ] as const)(
-  "runs a planned native side chat fork when the parent is $nativeForkFrom",
-  ({ nativeForkFrom, forks, transferStatus, handoffIds }) =>
+  "resolves a planned fork from role=$sourceRole to role=$targetRole while source is $nativeForkFrom",
+  ({ nativeForkFrom, forks, transferStatus, handoffIds, sourceRole, targetRole }) =>
     Effect.gen(function* () {
       const harness = makeLocalCommandHarness({
         text: "What is the main thread doing?",
-        sideChat: { contextRun: "current", nativeForkFrom },
+        sideChat: {
+          contextRun: "current",
+          nativeForkFrom,
+          ...(sourceRole === undefined ? {} : { sourceRole }),
+          ...(targetRole === undefined ? {} : { targetRole }),
+        },
       });
 
       yield* harness.start;
 
-      expect(harness.forkThread).toHaveBeenCalledTimes(forks ? 1 : 0);
       // The parent's rolled-back turn is gone from its native conversation.
       expect(
         harness.forkThread.mock.calls[0]?.[0].sourceProviderTurns?.map((turn) => turn.id),
@@ -1325,6 +1406,22 @@ effectIt.effect.each([
         !forks,
       );
       expect(harness.projection().providerThreads[0]?.handoffIds).toEqual(handoffIds);
+      expect(harness.forkThread).toHaveBeenCalledTimes(forks ? 1 : 0);
+    }),
+);
+
+effectIt.effect(
+  "rejects a pending native fork with missing authoritative source execution before inference",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue the fork",
+        sideChat: { contextRun: "current", nativeForkFrom: "idle", missingSource: true },
+      });
+      const failure = yield* harness.start.pipe(Effect.flip);
+      expect(failure._tag).toBe("ProviderTurnStartError");
+      expect(harness.projection().contextTransfers[0]?.status).toBe("pending");
+      expect(harness.startTurn.mock.calls).toEqual([]);
     }),
 );
 
