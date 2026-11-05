@@ -77,6 +77,7 @@ interface CapturedTurn {
   readonly driver: ProviderDriverKind;
   readonly threadId: ThreadId;
   readonly providerThreadId: ProviderThreadId;
+  readonly providerSessionId: ProviderSessionId;
   readonly text: string;
   readonly modelSelection: ModelSelection;
   readonly attachments: ReadonlyArray<ChatAttachment>;
@@ -94,6 +95,8 @@ function makeTestAdapter(input: {
   readonly driver: ProviderDriverKind;
   readonly capabilities: OrchestrationV2ProviderCapabilities;
   readonly modelSelection: ModelSelection;
+  readonly getCapabilities?: ProviderAdapter.ProviderAdapterV2["Service"]["getCapabilities"];
+  readonly planSelectionTransition?: ProviderAdapter.ProviderAdapterV2["Service"]["planSelectionTransition"];
   readonly responseByRunOrdinal: Readonly<Record<number, string>>;
   readonly responseByThreadId?: Readonly<Record<string, Readonly<Record<number, string>>>>;
   readonly capturedTurns: Ref.Ref<ReadonlyArray<CapturedTurn>>;
@@ -115,18 +118,22 @@ function makeTestAdapter(input: {
   readonly failedRunOrdinals?: ReadonlySet<number>;
   readonly interruptedRunOrdinals?: ReadonlySet<number>;
   readonly holdRunOrdinal?: number;
+  readonly holdFirstTurnForThreadId?: ThreadId;
+  readonly holdFirstTurnOnce?: Ref.Ref<boolean>;
   readonly pendingBackgroundWork?: Ref.Ref<boolean>;
   readonly subagentOnlyBackgroundWork?: boolean;
   readonly holdFirstTurn?: Deferred.Deferred<void>;
   readonly releaseFirstTurn?: Deferred.Deferred<void>;
   readonly backgroundWork?: Ref.Ref<boolean>;
   readonly closedSessions?: Ref.Ref<ReadonlyArray<string>>;
+  readonly unloadedThreads?: Ref.Ref<ReadonlyArray<string>>;
 }): ProviderAdapter.ProviderAdapterV2["Service"] {
   return {
     instanceId: input.instanceId,
     driver: input.driver,
-    getCapabilities: () => Effect.succeed(input.capabilities),
-    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+    getCapabilities: input.getCapabilities ?? (() => Effect.succeed(input.capabilities)),
+    planSelectionTransition:
+      input.planSelectionTransition ?? (() => Effect.succeed({ type: "apply_on_next_turn" })),
     openSession: (sessionInput) =>
       Effect.gen(function* () {
         const events = yield* PubSub.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
@@ -144,7 +151,10 @@ function makeTestAdapter(input: {
           status: "ready",
           cwd: sessionInput.runtimePolicy.cwd ?? process.cwd(),
           model: input.modelSelection.model,
-          capabilities: input.capabilities,
+          capabilities:
+            input.getCapabilities === undefined
+              ? input.capabilities
+              : yield* input.getCapabilities(sessionInput.modelSelection),
           createdAt: now,
           updatedAt: now,
           lastError: null,
@@ -269,6 +279,7 @@ function makeTestAdapter(input: {
                   driver: input.driver,
                   threadId: turnInput.threadId,
                   providerThreadId: turnInput.providerThread.id,
+                  providerSessionId: sessionInput.providerSessionId,
                   text: turnInput.message.text,
                   modelSelection: turnInput.modelSelection,
                   attachments: turnInput.message.attachments,
@@ -280,8 +291,12 @@ function makeTestAdapter(input: {
                 },
               ]);
               if (
+                (input.holdFirstTurnForThreadId === undefined ||
+                  input.holdFirstTurnForThreadId === turnInput.threadId) &&
                 turnInput.runOrdinal === (input.holdRunOrdinal ?? 1) &&
-                input.holdFirstTurn !== undefined
+                input.holdFirstTurn !== undefined &&
+                (input.holdFirstTurnOnce === undefined ||
+                  (yield* Ref.getAndSet(input.holdFirstTurnOnce, false)))
               ) {
                 yield* Deferred.succeed(input.holdFirstTurn, undefined);
                 if (input.releaseFirstTurn === undefined) return;
@@ -387,6 +402,19 @@ function makeTestAdapter(input: {
                 yield* PubSub.publish(events, event);
               }
             }),
+          ...(input.unloadedThreads === undefined
+            ? {}
+            : {
+                unloadThread: ({
+                  providerThread,
+                }: {
+                  readonly providerThread: OrchestrationV2ProviderThread;
+                }) =>
+                  Ref.update(input.unloadedThreads!, (ids) => [
+                    ...ids,
+                    providerThread.nativeThreadRef?.nativeId ?? "",
+                  ]),
+              }),
           steerTurn: () => Effect.void,
           interruptTurn: () => Effect.void,
           respondToRuntimeRequest: () => Effect.void,
@@ -438,6 +466,329 @@ class ClaudeMcpRegistrationTimeoutError extends Schema.TaggedError<ClaudeMcpRegi
 ) {}
 
 describe("orchestration v2 provider switching", () => {
+  it.live.each(["direct", "picker", "queued", "cold", "restart", "overlay", "legacy"] as const)(
+    "isolates role transitions and preserves shared Default peers through %s dispatch",
+    (mode) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const cwd = yield* checkpointWorkspace(`role-isolation-${mode}`);
+          const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+          const closedSessions = yield* Ref.make<ReadonlyArray<string>>([]);
+          const unloadedThreads = yield* Ref.make<ReadonlyArray<string>>([]);
+          const nativeThreadGeneration = yield* Ref.make(0);
+          const started = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const holdFirstTurnOnce = yield* Ref.make(true);
+          const overlayId = ProviderInstanceId.make("codex-role-overlay");
+          const role = (value: string): ModelSelection => ({
+            ...CODEX_MODEL_SELECTION,
+            ...(mode === "overlay" ? { instanceId: overlayId } : {}),
+            options: [{ id: "agent", value }],
+          });
+          const roleKey = (selection: ModelSelection) =>
+            selection.options?.find((option) => option.id === "agent")?.value;
+          const adapterInput = {
+            instanceId: CODEX_MODEL_SELECTION.instanceId,
+            driver: CODEX_DRIVER,
+            capabilities: CodexProviderCapabilitiesV2,
+            modelSelection: CODEX_MODEL_SELECTION,
+            getCapabilities: (selection) =>
+              Effect.succeed({
+                ...CodexProviderCapabilitiesV2,
+                sessions: {
+                  ...CodexProviderCapabilitiesV2.sessions,
+                  supportsMultipleProviderThreadsPerSession:
+                    selection === undefined || roleKey(selection) === undefined,
+                },
+              }),
+            planSelectionTransition: ({ current, target }) =>
+              Effect.succeed({
+                type:
+                  roleKey(current) === roleKey(target)
+                    ? "apply_on_next_turn"
+                    : "create_with_handoff",
+              }),
+            responseByRunOrdinal: {},
+            capturedTurns,
+            closedSessions,
+            unloadedThreads,
+            nativeThreadGeneration,
+            ...(mode === "queued" || mode === "restart"
+              ? {
+                  holdFirstTurn: started,
+                  holdFirstTurnOnce,
+                  holdFirstTurnForThreadId: ThreadId.make(`thread:role:${mode}`),
+                  ...(mode === "queued" ? { releaseFirstTurn: release } : {}),
+                }
+              : {}),
+          } satisfies Parameters<typeof makeTestAdapter>[0];
+          const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
+            makeTestAdapter(adapterInput),
+            makeTestAdapter({ ...adapterInput, instanceId: overlayId }),
+          ]);
+          const layerDatabase = SqlitePersistence.layerMemory;
+          yield* Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+            const moving = ThreadId.make(`thread:role:${mode}`);
+            const peer = ThreadId.make(`thread:role:peer:${mode}`);
+            const create = (id: ThreadId) =>
+              orchestrator.dispatch({
+                type: "thread.create",
+                createdBy: "user",
+                creationSource: "web",
+                commandId: CommandId.make(`create:${id}`),
+                threadId: id,
+                projectId,
+                title: "Role isolation",
+                modelSelection: CODEX_MODEL_SELECTION,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: null,
+                worktreePath: cwd,
+              });
+            const send = (
+              id: ThreadId,
+              ordinal: number,
+              selection: ModelSelection,
+              queued = false,
+            ) =>
+              orchestrator.dispatch({
+                type: "message.dispatch",
+                createdBy: "user",
+                creationSource: "web",
+                commandId: CommandId.make(`send:${id}:${ordinal}`),
+                threadId: id,
+                messageId: MessageId.make(`message:${id}:${ordinal}`),
+                text: `Factual marker ${ordinal}`,
+                attachments: [],
+                modelSelection: selection,
+                dispatchMode: { type: queued ? "queue_after_active" : "start_immediately" },
+              });
+            yield* create(moving);
+            yield* create(peer);
+            yield* send(peer, 1, CODEX_MODEL_SELECTION);
+            yield* waitForIdle(peer);
+            yield* send(moving, 1, CODEX_MODEL_SELECTION);
+            if (mode === "queued" || mode === "restart") yield* Deferred.await(started);
+            else yield* waitForIdle(moving);
+            const before = yield* orchestrator.getThreadProjection(moving);
+            const peerBefore = yield* orchestrator.getThreadProjection(peer);
+            const initial = (yield* Ref.get(capturedTurns)).filter(
+              (turn) => turn.threadId === moving,
+            )[0]!;
+            const peerInitial = (yield* Ref.get(capturedTurns)).filter(
+              (turn) => turn.threadId === peer,
+            )[0]!;
+            assert.equal(initial.providerSessionId, peerInitial.providerSessionId);
+            if (mode === "legacy") {
+              const sink = yield* EventSink.EventSinkV2;
+              const now = yield* DateTime.now;
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("event:role:legacy:unknown-native-selection"),
+                    type: "run.updated",
+                    threadId: moving,
+                    runId: before.runs[0]!.id,
+                    providerInstanceId: CODEX_MODEL_SELECTION.instanceId,
+                    occurredAt: now,
+                    payload: { ...before.runs[0]!, providerThreadId: null },
+                  },
+                ],
+              });
+              yield* orchestrator.dispatch({
+                type: "thread.model-selection.set",
+                commandId: CommandId.make(`picker:${moving}`),
+                threadId: moving,
+                modelSelection: role("orchestrator"),
+              });
+              yield* worker.drain();
+              const legacy = yield* orchestrator.getThreadProjection(moving);
+              assert.isFalse(
+                legacy.runs.some(
+                  (run) => run.providerThreadId === legacy.thread.activeProviderThreadId,
+                ),
+              );
+            }
+            if (mode === "picker") {
+              yield* orchestrator.dispatch({
+                type: "thread.model-selection.set",
+                commandId: CommandId.make(`picker:${moving}`),
+                threadId: moving,
+                modelSelection: role("orchestrator"),
+              });
+              yield* worker.drain();
+            }
+            if (mode === "cold") {
+              yield* orchestrator.dispatch({
+                type: "provider-session.detach",
+                commandId: CommandId.make(`detach:${moving}`),
+                threadId: moving,
+                providerSessionId: initial.providerSessionId,
+              });
+              yield* worker.drain();
+            }
+            if (mode === "restart") {
+              const sink = yield* EventSink.EventSinkV2;
+              const activeRun = before.runs[0]!;
+              const now = yield* DateTime.now;
+              const runningTurn = {
+                id: ProviderTurnId.make(`provider-turn:role:restart`),
+                providerThreadId: activeRun.providerThreadId!,
+                nodeId: activeRun.rootNodeId!,
+                runAttemptId: activeRun.activeAttemptId!,
+                nativeTurnRef: null,
+                ordinal: 1,
+                status: "running" as const,
+                startedAt: now,
+                completedAt: null,
+              };
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("event:role:running"),
+                    type: "provider-turn.updated",
+                    threadId: moving,
+                    runId: activeRun.id,
+                    nodeId: activeRun.rootNodeId!,
+                    driver: CODEX_DRIVER,
+                    providerInstanceId: CODEX_MODEL_SELECTION.instanceId,
+                    occurredAt: now,
+                    payload: runningTurn,
+                  },
+                ],
+              });
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                createdBy: "user",
+                creationSource: "web",
+                commandId: CommandId.make("role:restart:steer"),
+                threadId: moving,
+                messageId: MessageId.make("message:role:restart:steer"),
+                text: "Factual marker 2",
+                attachments: [],
+                modelSelection: role("orchestrator"),
+                dispatchMode: { type: "steer_active", targetRunId: activeRun.id },
+              });
+              const previousAttempt = before.attempts.find(
+                (attempt) => attempt.id === activeRun.activeAttemptId,
+              )!;
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("event:role:interrupted"),
+                    type: "provider-turn.updated",
+                    threadId: moving,
+                    runId: activeRun.id,
+                    nodeId: activeRun.rootNodeId!,
+                    driver: CODEX_DRIVER,
+                    providerInstanceId: CODEX_MODEL_SELECTION.instanceId,
+                    occurredAt: now,
+                    payload: { ...runningTurn, status: "interrupted", completedAt: now },
+                  },
+                  {
+                    id: EventId.make("event:role:attempt-interrupted"),
+                    type: "run-attempt.updated",
+                    threadId: moving,
+                    runId: activeRun.id,
+                    nodeId: activeRun.rootNodeId!,
+                    providerInstanceId: CODEX_MODEL_SELECTION.instanceId,
+                    occurredAt: now,
+                    payload: { ...previousAttempt, status: "interrupted", completedAt: now },
+                  },
+                ],
+              });
+            } else {
+              yield* send(moving, 2, role("orchestrator"), mode === "queued");
+              if (mode === "queued") {
+                const queued = yield* orchestrator.getThreadProjection(moving);
+                assert.equal(queued.runs[1]?.status, "queued");
+                yield* Deferred.succeed(release, undefined);
+              }
+            }
+            yield* waitForIdle(moving);
+            yield* worker.drain();
+            const afterRole = yield* orchestrator.getThreadProjection(moving);
+            const roleTurn = (yield* Ref.get(capturedTurns)).filter(
+              (turn) => turn.threadId === moving,
+            )[1]!;
+            assert.notEqual(roleTurn.providerSessionId, initial.providerSessionId);
+            assert.notEqual(roleTurn.nativeThreadId, initial.nativeThreadId);
+            assert.equal(afterRole.thread.id, before.thread.id);
+            assert.include(roleTurn.text, "Factual marker 1");
+            assert.equal(afterRole.contextHandoffs.at(-1)?.strategy, "full_thread_summary");
+            assert.notInclude(yield* Ref.get(closedSessions), initial.providerSessionId);
+            assert.include(yield* Ref.get(unloadedThreads), initial.nativeThreadId);
+            assert.notInclude(yield* Ref.get(unloadedThreads), peerInitial.nativeThreadId);
+            yield* send(moving, 3, role("reviewer"));
+            yield* waitForIdle(moving);
+            yield* send(moving, 3.5, {
+              ...role("reviewer"),
+              model: "gpt-next",
+              options: [
+                { id: "agent", value: "reviewer" },
+                { id: "reasoningEffort", value: "low" },
+              ],
+            });
+            yield* waitForIdle(moving);
+            yield* send(moving, 4, CODEX_MODEL_SELECTION);
+            yield* waitForIdle(moving);
+            yield* send(moving, 5, {
+              ...CODEX_MODEL_SELECTION,
+              model: "gpt-next",
+              options: [{ id: "reasoningEffort", value: "low" }],
+            });
+            yield* waitForIdle(moving);
+            yield* send(peer, 2, CODEX_MODEL_SELECTION);
+            yield* waitForIdle(peer);
+            const turns = (yield* Ref.get(capturedTurns)).filter(
+              (turn) => turn.threadId === moving,
+            );
+            assert.notEqual(turns[2]!.providerSessionId, turns[1]!.providerSessionId);
+            assert.notEqual(turns[2]!.nativeThreadId, turns[1]!.nativeThreadId);
+            assert.equal(turns[3]!.providerSessionId, turns[2]!.providerSessionId);
+            assert.equal(turns[3]!.nativeThreadId, turns[2]!.nativeThreadId);
+            assert.notEqual(turns[4]!.providerSessionId, turns[3]!.providerSessionId);
+            assert.notEqual(turns[4]!.nativeThreadId, turns[0]!.nativeThreadId);
+            assert.equal(turns[5]!.providerSessionId, turns[4]!.providerSessionId);
+            assert.equal(turns[5]!.nativeThreadId, turns[4]!.nativeThreadId);
+            const peerAfter = yield* orchestrator.getThreadProjection(peer);
+            const peerTurn = (yield* Ref.get(capturedTurns)).filter(
+              (turn) => turn.threadId === peer,
+            )[1]!;
+            assert.equal(peerTurn.providerSessionId, peerInitial.providerSessionId);
+            assert.equal(peerTurn.nativeThreadId, peerInitial.nativeThreadId);
+            assert.equal(
+              peerAfter.thread.activeProviderThreadId,
+              peerBefore.thread.activeProviderThreadId,
+            );
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                layerDatabase,
+                ProviderReplayHarness.layerWithRegistry(
+                  {
+                    name: `role-isolation-${mode}`,
+                    runtimePolicyOverride: {
+                      cwd,
+                      approvalPolicy: "never",
+                      sandboxPolicy: {
+                        type: "readOnly",
+                        access: { type: "fullAccess" },
+                        networkAccess: false,
+                      },
+                    },
+                  },
+                  layerRegistry,
+                  { databaseLayer: layerDatabase },
+                ),
+              ),
+            ),
+          );
+        }),
+      ),
+  );
   it.live.each([
     "compact-native",
     "compact-legacy",

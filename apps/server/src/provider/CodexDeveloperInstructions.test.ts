@@ -9,6 +9,19 @@ import {
 } from "./CodexDeveloperInstructions.ts";
 
 describe("buildCodexAdditionalContext", () => {
+  it("preserves long UTF-8 role instructions as bounded application entries", () => {
+    const instructions = "Role 🦊 নীতি\n".repeat(900);
+    const context = buildCodexAdditionalContext({ model: "gpt-6.1-sol" }, false, instructions);
+    const chunks = Object.entries(context).filter(([key]) => key.startsWith("t3_code_role_"));
+    NodeAssert.equal(chunks.map(([, entry]) => entry.value).join(""), instructions);
+    NodeAssert.ok(
+      chunks.every(
+        ([, entry]) => entry.kind === "application" && Buffer.byteLength(entry.value) <= 4000,
+      ),
+    );
+    NodeAssert.ok(chunks.every(([, entry]) => !entry.value.includes("�")));
+  });
+
   describe.each([
     { model: "custom-model", modelName: "Custom 🦊 Model", reasoningEffort: "xhigh" },
   ])("with runtime $model", (runtime) => {

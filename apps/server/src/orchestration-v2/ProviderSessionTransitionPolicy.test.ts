@@ -101,3 +101,22 @@ it("uses portable handoff for incompatible continuation identities", () => {
     { type: "create_with_handoff" },
   );
 });
+
+it("honors a required fresh context across compatible provider instances", () => {
+  assert.deepEqual(
+    decideProviderSessionTransition({
+      current: base,
+      target: {
+        ...base,
+        modelSelection: {
+          ...base.modelSelection,
+          instanceId: ProviderInstanceId.make("codex_overlay"),
+          options: [{ id: "agent", value: "reviewer" }],
+        },
+        available: true,
+      },
+      selectionTransition: { type: "create_with_handoff" },
+    }),
+    { type: "create_with_handoff" },
+  );
+});

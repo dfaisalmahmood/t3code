@@ -24,6 +24,7 @@ export function resolveProviderOptionDescriptors(input: {
 export function applyProviderOptionSelection(
   descriptors: ReadonlyArray<ProviderOptionDescriptor>,
   change: ProviderOptionSelection,
+  currentSelections?: ReadonlyArray<ProviderOptionSelection> | null | undefined,
 ): ReadonlyArray<ProviderOptionSelection> | null {
   const descriptor = descriptors.find((candidate) => candidate.id === change.id);
   if (!descriptor) {
@@ -47,5 +48,5 @@ export function applyProviderOptionSelection(
       : candidate,
   ) as ReadonlyArray<ProviderOptionDescriptor>;
 
-  return buildProviderOptionSelectionsFromDescriptors(nextDescriptors) ?? [];
+  return buildProviderOptionSelectionsFromDescriptors(nextDescriptors, currentSelections) ?? [];
 }

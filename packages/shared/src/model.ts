@@ -151,6 +151,14 @@ function resolveDescriptorChoiceValue(
   if (descriptor.options.some((option) => option.id === trimmed)) {
     return trimmed;
   }
+  if (descriptor.id === "agent" && !["default", "build", "plan"].includes(trimmed)) {
+    const separator = trimmed.indexOf("@");
+    const logicalName = separator < 0 ? trimmed : trimmed.slice(0, separator);
+    const matches = descriptor.options.filter(
+      (option) => separator < 0 && option.id.startsWith(`${logicalName}@`),
+    );
+    return matches.length === 1 ? matches[0]!.id : trimmed;
+  }
   return descriptor.currentValue ?? descriptor.options.find((option) => option.isDefault)?.id;
 }
 
@@ -283,27 +291,44 @@ export function getProviderOptionCurrentLabel(
       ? "Default"
       : descriptor.id === "variant"
         ? "Unknown"
-        : undefined)
+        : descriptor.id === "agent" && typeof currentValue === "string"
+          ? `Unavailable: ${currentValue}`
+          : undefined)
   );
 }
 
 export function buildProviderOptionSelectionsFromDescriptors(
   descriptors: ReadonlyArray<ProviderOptionDescriptor> | null | undefined,
+  currentSelections?: ReadonlyArray<ProviderOptionSelection> | null,
 ): Array<ProviderOptionSelection> | undefined {
-  if (!descriptors || descriptors.length === 0) {
-    return undefined;
-  }
-
   const nextSelections: Array<ProviderOptionSelection> = [];
 
-  for (const descriptor of descriptors) {
+  for (const descriptor of descriptors ?? []) {
     const value = getProviderOptionCurrentValue(descriptor);
     if (typeof value === "string" || typeof value === "boolean") {
       nextSelections.push({ id: descriptor.id, value });
     }
   }
 
+  const agent = currentSelections?.find((option) => option.id === "agent");
+  if (
+    !descriptors?.some((descriptor) => descriptor.id === "agent") &&
+    agent &&
+    typeof agent.value === "string" &&
+    !["default", "build", "plan"].includes(agent.value)
+  )
+    nextSelections.push(agent);
   return nextSelections.length > 0 ? nextSelections : undefined;
+}
+
+export function carryProviderAgentSelection(input: {
+  readonly targetSelections: ReadonlyArray<ProviderOptionSelection> | null | undefined;
+  readonly currentSelections: ReadonlyArray<ProviderOptionSelection> | null | undefined;
+}): Array<ProviderOptionSelection> | undefined {
+  const options = (input.targetSelections ?? []).filter((option) => option.id !== "agent");
+  const agent = input.currentSelections?.find((option) => option.id === "agent");
+  if (agent) options.push(agent);
+  return options.length ? options : undefined;
 }
 
 export function buildExplicitProviderOptionSelectionsFromDescriptors(
@@ -314,10 +339,26 @@ export function buildExplicitProviderOptionSelectionsFromDescriptors(
     return undefined;
   }
   const explicitIds = new Set(selections.map((selection) => selection.id));
-  const normalized = buildProviderOptionSelectionsFromDescriptors(descriptors)?.filter(
-    (selection) => explicitIds.has(selection.id),
-  );
-  return normalized && normalized.length > 0 ? normalized : undefined;
+  const normalized =
+    buildProviderOptionSelectionsFromDescriptors(descriptors)?.filter((selection) =>
+      explicitIds.has(selection.id),
+    ) ?? [];
+  const agent = selections.find((selection) => selection.id === "agent");
+  const descriptor = descriptors?.find((entry) => entry.id === "agent" && entry.type === "select");
+  if (agent && typeof agent.value === "string") {
+    const value =
+      descriptor?.type === "select"
+        ? resolveDescriptorChoiceValue(descriptor, agent.value)
+        : !["default", "build", "plan"].includes(agent.value)
+          ? agent.value
+          : undefined;
+    if (value !== undefined) {
+      const index = normalized.findIndex((entry) => entry.id === "agent");
+      if (index >= 0) normalized[index] = { id: "agent", value };
+      else normalized.push({ id: "agent", value });
+    }
+  }
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 export function isClaudeUltrathinkPrompt(text: string | null | undefined): boolean {

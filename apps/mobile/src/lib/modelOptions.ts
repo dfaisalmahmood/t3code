@@ -20,6 +20,7 @@ import {
 } from "@t3tools/contracts";
 import {
   buildExplicitProviderOptionSelectionsFromDescriptors,
+  carryProviderAgentSelection,
   getProviderOptionDescriptors,
 } from "@t3tools/shared/model";
 import { resolveModelShortName } from "@t3tools/client-runtime/provider-clients";
@@ -292,6 +293,10 @@ export function buildModelOptions(
       }
     : machineConfig;
   const options = new Map<string, ModelOption>();
+  const carriedAgentOptions = carryProviderAgentSelection({
+    targetSelections: undefined,
+    currentSelections: fallbackModelSelection?.options,
+  });
   const lockedProvider = config?.providers.find(
     (provider) => provider.instanceId === providerInstanceId,
   );
@@ -395,6 +400,7 @@ export function buildModelOptions(
           {
             instanceId: provider.instanceId,
             model: model.slug,
+            ...(carriedAgentOptions ? { options: carriedAgentOptions } : {}),
           },
           model.capabilities,
         ),

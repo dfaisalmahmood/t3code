@@ -1832,6 +1832,50 @@ it.effect(
 );
 
 it.effect.each([
+  { capabilities: CodexCapabilities, rotates: false },
+  { capabilities: ExclusiveCapabilities, rotates: true },
+])(
+  "isolates a new dedicated runtime's MCP credential while retaining ordinary shared reuse ($rotates)",
+  ({ capabilities, rotates }) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const program = Effect.gen(function* () {
+        const registry = yield* McpSessionRegistry.McpSessionRegistry;
+        const sessions = yield* McpProviderSessions.McpProviderSessions;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const threadId = ThreadId.make("thread-credential-isolation");
+        yield* (yield* EventSink.EventSinkV2).write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now: yield* DateTime.now }),
+          ],
+        });
+        const old = yield* registry.issue({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* sessions.set(old.config);
+        yield* manager.open({
+          threadId,
+          providerSessionId: yield* idAllocator.allocate.providerSession({
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+          }),
+          modelSelection,
+          runtimePolicy,
+        });
+        const current = yield* sessions.read(threadId);
+        assert.equal(current?.providerSessionId !== old.config.providerSessionId, rotates);
+        assert.equal(
+          (yield* registry.resolve(old.config.authorizationHeader.slice(7))) === undefined,
+          rotates,
+        );
+      });
+      yield* program.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000, capabilities })));
+    }),
+);
+
+it.effect.each([
   { relationshipToParent: null, subagent: false },
   { relationshipToParent: "subagent", subagent: true },
 ] as const)(

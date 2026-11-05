@@ -1,4 +1,9 @@
-import { resolveProviderForCwd } from "@t3tools/shared/model";
+import {
+  buildExplicitProviderOptionSelectionsFromDescriptors,
+  carryProviderAgentSelection,
+  getProviderOptionDescriptors,
+  resolveProviderForCwd,
+} from "@t3tools/shared/model";
 import { isWebhookDedupeTemplate } from "@t3tools/contracts";
 import {
   EnvironmentId,
@@ -364,4 +369,31 @@ export function defaultScheduledTaskProjectId<
       (scopedToProject ? scopedProjects[0] : undefined)
     )?.id ?? ""
   );
+}
+
+export function scheduledTaskModelSelection(input: {
+  readonly currentSelection: ModelSelection | null;
+  readonly effectiveSelection?: ModelSelection | null;
+  readonly targetSelection: ModelSelection;
+  readonly providers: ReadonlyArray<ServerProvider>;
+}): ModelSelection {
+  const { targetSelection, providers } = input;
+  const currentSelection = input.currentSelection ?? input.effectiveSelection;
+  if (
+    currentSelection?.instanceId === targetSelection.instanceId &&
+    currentSelection.model === targetSelection.model
+  )
+    return currentSelection;
+  const carriedOptions = carryProviderAgentSelection({
+    targetSelections: targetSelection.options,
+    currentSelections: currentSelection?.options,
+  });
+  const capabilities = providers
+    .find((provider) => provider.instanceId === targetSelection.instanceId)
+    ?.models.find((model) => model.slug === targetSelection.model)?.capabilities;
+  const options = buildExplicitProviderOptionSelectionsFromDescriptors(
+    getProviderOptionDescriptors({ caps: capabilities ?? {}, selections: carriedOptions }),
+    carriedOptions,
+  );
+  return options ? { ...targetSelection, options } : targetSelection;
 }

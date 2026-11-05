@@ -40,6 +40,7 @@ import * as Equal from "effect/Equal";
 import * as Effect from "effect/Effect";
 import { DeepMutable } from "effect/Types";
 import {
+  carryProviderAgentSelection,
   createModelSelection,
   draftModelPickMatchesThread,
   normalizeModelSlug,
@@ -506,7 +507,10 @@ interface ComposerDraftStoreState {
   markDraftThreadPromoting: (threadRef: ComposerThreadTarget, promotedTo?: ScopedThreadRef) => void;
   finalizePromotedDraftThread: (threadRef: ComposerThreadTarget) => void;
   clearDraftThread: (threadRef: ComposerThreadTarget) => void;
-  setStickyModelSelection: (modelSelection: ModelSelection | null | undefined) => void;
+  setStickyModelSelection: (
+    modelSelection: ModelSelection | null | undefined,
+    options?: { readonly replaceOptions?: boolean },
+  ) => void;
   setPrompt: (threadRef: ComposerThreadTarget, prompt: string) => void;
   setTerminalContexts: (threadRef: ComposerThreadTarget, contexts: TerminalContextDraft[]) => void;
   setModelSelection: (
@@ -1168,15 +1172,32 @@ export function deriveEffectiveComposerModelState(input: {
     ].find((selections) => modelSelectionByProviderToOptions(selections) !== null) ?? null;
   const modelOptions = modelSelectionByProviderToOptions(optionSelections);
 
-  return {
+  const fallbackOptions = withFallbackInstanceOptions({
+    ...input,
+    modelOptions,
+    optionSelections,
     selectedModel,
-    modelOptions: withFallbackInstanceOptions({
-      ...input,
-      modelOptions,
-      optionSelections,
-      selectedModel,
-    }),
-  };
+  });
+  const currentSelection =
+    (input.draft?.activeProvider
+      ? input.draft.modelSelectionByProvider[input.draft.activeProvider]
+      : null) ??
+    input.threadModelSelection ??
+    input.projectModelSelection;
+  const carriedOptions =
+    input.selectedInstanceId &&
+    currentSelection &&
+    currentSelection.instanceId !== input.selectedInstanceId
+      ? {
+          ...fallbackOptions,
+          [input.selectedInstanceId]: carryProviderAgentSelection({
+            targetSelections: fallbackOptions?.[input.selectedInstanceId],
+            currentSelections: currentSelection.options,
+          }),
+        }
+      : fallbackOptions;
+
+  return { selectedModel, modelOptions: carriedOptions };
 }
 
 /**
@@ -2876,7 +2897,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             return removeDraftThreadReferences(state, threadKey);
           });
         },
-        setStickyModelSelection: (modelSelection) => {
+        setStickyModelSelection: (modelSelection, options) => {
           const normalized = normalizeModelSelection(modelSelection);
           set((state) => {
             if (!normalized) {
@@ -2885,7 +2906,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             const current = state.stickyModelSelectionByProvider[normalized.instanceId];
             // Model-only updates omit options; preserve sticky traits across model switches and new chats.
             const nextSelection =
-              normalized.options !== undefined
+              normalized.options !== undefined || options?.replaceOptions
                 ? normalized
                 : createModelSelection(normalized.instanceId, normalized.model, current?.options);
             const nextMap: Partial<Record<ProviderInstanceId, ModelSelection>> = {

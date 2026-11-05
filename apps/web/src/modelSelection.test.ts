@@ -477,6 +477,109 @@ describe("instance-scoped model selection", () => {
     });
   });
 
+  it("carries the active Agent across provider handoff without carrying reasoning options", () => {
+    const sourceId = ProviderInstanceId.make("opencode_work");
+    const targetId = ProviderInstanceId.make("codex");
+    const roleId = `mason@${"a".repeat(64)}`;
+    const source = createModelSelection(sourceId, "openai/gpt-6-sol", [
+      { id: "agent", value: "mason" },
+      { id: "variant", value: "high" },
+    ]);
+    const target = createModelSelection(targetId, "gpt-6-sol", [
+      { id: "agent", value: "warden" },
+      { id: "reasoningEffort", value: "low" },
+      { id: "serviceTier", value: "priority" },
+    ]);
+    const providers: ReadonlyArray<ServerProvider> = [
+      provider({ provider: ProviderDriverKind.make("opencode"), instanceId: sourceId }),
+      {
+        ...provider({ instanceId: targetId }),
+        models: [
+          {
+            slug: target.model,
+            name: target.model,
+            isCustom: false,
+            capabilities: {
+              optionDescriptors: [
+                {
+                  id: "agent",
+                  label: "Agent",
+                  type: "select",
+                  options: [
+                    { id: "default", label: "Default", isDefault: true },
+                    { id: roleId, label: "Mason" },
+                  ],
+                },
+                {
+                  id: "reasoningEffort",
+                  label: "Reasoning",
+                  type: "select",
+                  options: [
+                    { id: "low", label: "Low" },
+                    { id: "high", label: "High" },
+                  ],
+                },
+                {
+                  id: "serviceTier",
+                  label: "Service Tier",
+                  type: "select",
+                  options: [
+                    { id: "default", label: "Standard", isDefault: true },
+                    { id: "priority", label: "Fast" },
+                  ],
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ];
+    for (const draft of [
+      {
+        activeProvider: sourceId,
+        modelSelectionByProvider: { [sourceId]: source, [targetId]: target },
+      },
+      null,
+    ]) {
+      for (const agent of ["mason", `mason@${"b".repeat(64)}`, "missing-role"]) {
+        const current = { ...source, options: [{ id: "agent", value: agent }] };
+        const state = deriveEffectiveComposerModelState({
+          draft: draft
+            ? {
+                ...draft,
+                modelSelectionByProvider: {
+                  ...draft.modelSelectionByProvider,
+                  [sourceId]: current,
+                },
+              }
+            : null,
+          providers,
+          selectedProvider: ProviderDriverKind.make("codex"),
+          selectedInstanceId: targetId,
+          threadModelSelection: current,
+          projectModelSelection: null,
+          settings: settingsWithProviderInstances(),
+        });
+        const dispatch = getComposerProviderState({
+          provider: ProviderDriverKind.make("codex"),
+          model: state.selectedModel,
+          models: providers[1]!.models,
+          modelOptions: state.modelOptions?.[targetId],
+          planModeEnabled: false,
+        });
+        expect(dispatch.modelOptionsForDispatch).toEqual([
+          { id: "agent", value: agent === "mason" ? roleId : agent },
+          ...(draft
+            ? [
+                { id: "reasoningEffort", value: "low" },
+                { id: "serviceTier", value: "priority" },
+              ]
+            : []),
+        ]);
+      }
+    }
+  });
+
   it("falls back from an explicit non-OpenCode draft with a missing model", () => {
     const instanceId = ProviderInstanceId.make("codex");
     const driver = ProviderDriverKind.make("codex");

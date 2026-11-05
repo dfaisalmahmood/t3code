@@ -378,7 +378,13 @@ function knownOptions(
   descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
 ): ReadonlyArray<ProviderOptionSelection> | undefined {
   if (options === undefined || descriptors === undefined) return options;
-  return options.filter((option) => descriptors.some((descriptor) => descriptor.id === option.id));
+  return options.filter(
+    (option) =>
+      (option.id === "agent" &&
+        typeof option.value === "string" &&
+        !["default", "build", "plan"].includes(option.value)) ||
+      descriptors.some((descriptor) => descriptor.id === option.id),
+  );
 }
 
 /** Skip checks without descriptors; reject duplicate IDs because consumers disagree on precedence. */

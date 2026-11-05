@@ -127,6 +127,8 @@ export interface McpInvocationScope {
   readonly capabilities: ReadonlySet<McpCapability>;
   readonly issuedAt: number;
   readonly requestNamespace: string;
+  readonly allowedToolNames?: ReadonlyArray<string>;
+  readonly providerCredential?: true;
   readonly thread: McpThreadCaller | undefined;
   readonly client: McpClientCaller | undefined;
   /** False while the Linked environments beta is off here; `/mcp` reads it per request. */

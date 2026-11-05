@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import { getProviderOptionCurrentLabel, getProviderOptionDescriptors } from "@t3tools/shared/model";
 
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -119,6 +120,85 @@ describe("mobile model options", () => {
     expect(groupByProvider(options)).toEqual([
       { providerKey: "opencode_work", providerLabel: "OpenCode Work", models: options },
     ]);
+  });
+
+  it("carries only the selected Agent into scoped provider and model picks", () => {
+    const roleId = `mason@${"a".repeat(64)}`;
+    const config = {
+      providers: ["codex", "opencode"].map((driver) => ({
+        instanceId: driver,
+        driver,
+        enabled: true,
+        installed: true,
+        auth: { status: "authenticated" },
+        models: [],
+        workspaceSnapshots: [
+          {
+            cwd: "/workspace",
+            checkedAt: "2026-01-01T00:00:00.000Z",
+            slashCommands: [],
+            skills: [],
+            models: [
+              {
+                slug: "gpt-test",
+                name: "GPT Test",
+                isCustom: false,
+                capabilities: {
+                  optionDescriptors: [
+                    {
+                      id: "agent",
+                      label: "Agent",
+                      type: "select",
+                      options: [
+                        { id: "default", label: "Default", isDefault: true },
+                        { id: driver === "codex" ? roleId : "mason", label: "Mason" },
+                      ],
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      })),
+    } as unknown as ServerConfig;
+    for (const [instanceId, agent, expected] of [
+      ["opencode", "mason", roleId],
+      ["codex", roleId, roleId],
+      ["opencode", "missing-role", "missing-role"],
+      ["opencode", `mason@${"b".repeat(64)}`, `mason@${"b".repeat(64)}`],
+    ] as const) {
+      const source = {
+        instanceId: ProviderInstanceId.make(instanceId),
+        model: "gpt-test",
+        options: [
+          { id: "agent", value: agent },
+          { id: "reasoningEffort", value: "high" },
+        ],
+      };
+      const options = buildModelOptions(config, source, undefined, null, false, "/workspace");
+      const target = options.find((option) => option.selection.instanceId !== instanceId);
+      expect(target?.selection.options).toEqual([{ id: "agent", value: expected }]);
+      if (instanceId === "codex" && target?.capabilities) {
+        const descriptor = getProviderOptionDescriptors({
+          caps: target.capabilities,
+          selections: target.selection.options,
+        }).find((option) => option.id === "agent");
+        expect(getProviderOptionCurrentLabel(descriptor)).toBe(`Unavailable: ${roleId}`);
+      }
+    }
+    const ordinary = buildModelOptions(
+      config,
+      {
+        instanceId: ProviderInstanceId.make("opencode"),
+        model: "gpt-test",
+      },
+      undefined,
+      null,
+      false,
+      "/workspace",
+    );
+    expect(ordinary.every((option) => option.selection.options === undefined)).toBe(true);
   });
 
   it("does not materialize catalog defaults for missing stored options", () => {

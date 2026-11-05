@@ -366,6 +366,7 @@ export const layerExecutor: Layer.Layer<
                       ? providerSessions.detach({
                           providerSessionId: effect.request.providerSessionId,
                           threadId: effect.threadId,
+                          revokeMcpCredential: true,
                           detail: "Provider thread handoff replaced this session binding.",
                         })
                       : Effect.void,

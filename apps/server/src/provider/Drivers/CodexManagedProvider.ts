@@ -1,4 +1,8 @@
 import {
+  loadCodexManagementRoles,
+  withCodexManagementRoleOptions,
+} from "../CodexManagementRoles.ts";
+import {
   ProviderDriverKind,
   ProviderSetupError,
   TextGenerationError,
@@ -245,6 +249,7 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
   const orchestrationAdapter = yield* createCodexAdapterV2(input, {
     onUsageLimits: (update) => snapshot.applyUsageLimits(update),
     resolveRuntime: runtime.resolve,
+    managementRoleSource: runtime.managementRoleSource,
   }).pipe(
     Effect.mapError(
       (cause) =>
@@ -317,12 +322,27 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
                   environment: effective.environment,
                 }).pipe(
                   Effect.flatMap((skills) =>
-                    snapshot.getSnapshot.pipe(Effect.map((draft) => ({ ...draft, skills }))),
+                    snapshot.getSnapshot.pipe(
+                      Effect.flatMap((draft) =>
+                        loadCodexManagementRoles({
+                          homePath: effective.config.homePath,
+                          environment: effective.environment,
+                        }).pipe(
+                          Effect.map((roles) => ({
+                            ...draft,
+                            skills,
+                            models: withCodexManagementRoleOptions(draft.models, roles),
+                          })),
+                        ),
+                      ),
+                    ),
                   ),
                 ),
             }),
             Effect.scoped,
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
             // Fail instead of returning machine inventory, which the registry would publish as workspace inventory.
             Effect.mapError(
               (cause) =>

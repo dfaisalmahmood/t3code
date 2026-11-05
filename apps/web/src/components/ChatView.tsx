@@ -2834,6 +2834,7 @@ export default function ChatView(props: ChatViewProps) {
     activeProjectSettings,
     settings,
     providerStatuses,
+    cwd: gitCwd,
     lockedProvider,
     supportsProviderSwitchingViaHandoff,
     multipleModelSelections,

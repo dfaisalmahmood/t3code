@@ -1,3 +1,7 @@
+import {
+  loadCodexManagementRoles,
+  withCodexManagementRoleOptions,
+} from "./CodexManagementRoles.ts";
 import { pipe } from "effect/Function";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -859,6 +863,10 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
             checkedAt,
           });
 
+  const managementRoles = yield* loadCodexManagementRoles({
+    homePath: codexSettings.homePath,
+    environment,
+  }).pipe(Effect.orElseSucceed(() => []));
   return buildServerProvider({
     presentation: CODEX_PRESENTATION,
     enabled: codexSettings.enabled,
@@ -867,6 +875,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
       appendCustomCodexModels(snapshot.models ?? [], codexSettings.customModels),
       applyPreferredCodexDefaultModel,
       (models) => applyConfiguredCodexServiceTier(models, snapshot.serviceTier),
+      (models) => withCodexManagementRoleOptions(models, managementRoles),
     ),
     skills: snapshot.skills,
     slashCommands: [

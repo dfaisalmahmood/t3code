@@ -20,6 +20,7 @@ import {
 
 export interface ProviderSwitchPlanV2 {
   readonly instanceChanged: boolean;
+  readonly requiresFreshProviderThread: boolean;
   readonly releaseProviderSessionIds: ReadonlyArray<ProviderSessionId>;
   readonly transition: ProviderSessionTransition;
 }
@@ -38,8 +39,16 @@ export interface ProviderSwitchServiceV2Shape {
     readonly projection: Pick<
       OrchestrationV2ThreadProjection,
       "thread" | "providerSessions" | "providerThreads"
-    >;
+    > & {
+      readonly runs?: ReadonlyArray<
+        Pick<
+          OrchestrationV2ThreadProjection["runs"][number],
+          "providerThreadId" | "modelSelection" | "status"
+        >
+      >;
+    };
     readonly targetModelSelection: ModelSelection;
+    readonly currentModelSelectionKnown?: boolean;
   }) => Effect.Effect<ProviderSwitchPlanV2, ProviderSwitchPlanError>;
 }
 
@@ -62,8 +71,29 @@ export const layer: Layer.Layer<
     const adapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
     return ProviderSwitchServiceV2.of({
       plan: Effect.fn("ProviderSwitchService.plan")(
-        function* ({ projection, targetModelSelection }) {
-          const current = projection.thread.modelSelection;
+        function* ({ projection, targetModelSelection, currentModelSelectionKnown }) {
+          const activeProviderThread = projection.providerThreads.find(
+            (thread) => thread.id === projection.thread.activeProviderThreadId,
+          );
+          const priorRun =
+            activeProviderThread === undefined
+              ? undefined
+              : projection.runs?.findLast(
+                  (run) =>
+                    run.providerThreadId === activeProviderThread.id &&
+                    run.status !== "queued" &&
+                    run.status !== "preparing",
+                );
+          const current = priorRun?.modelSelection ?? {
+            ...projection.thread.modelSelection,
+            ...(activeProviderThread
+              ? { instanceId: activeProviderThread.providerInstanceId }
+              : {}),
+          };
+          const sourceSelectionKnown =
+            priorRun !== undefined
+              ? true
+              : (currentModelSelectionKnown ?? projection.runs === undefined);
           const instanceChanged = current.instanceId !== targetModelSelection.instanceId;
           const getMetadata = (instanceId: typeof current.instanceId) =>
             adapters.getMetadata !== undefined
@@ -89,9 +119,72 @@ export const layer: Layer.Layer<
               (left, right) =>
                 DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
             );
-          const currentSession = currentSessions.find(isLiveProviderSession);
+          const currentSession =
+            currentSessions.find(
+              (session) =>
+                isLiveProviderSession(session) &&
+                session.id === activeProviderThread?.providerSessionId,
+            ) ?? currentSessions.find(isLiveProviderSession);
           const negotiatedCapabilities =
             currentSession?.capabilities ?? currentSessions[0]?.capabilities;
+          const sourceAdapter = yield* Effect.option(adapters.get(current.instanceId));
+          const currentAgent = current.options?.find((option) => option.id === "agent")?.value;
+          const targetAgent = targetModelSelection.options?.find(
+            (option) => option.id === "agent",
+          )?.value;
+          if (
+            Option.isNone(sourceAdapter) &&
+            typeof currentAgent === "string" &&
+            currentAgent.includes("@") &&
+            currentAgent === targetAgent
+          )
+            return yield* new ProviderSwitchPlanError({
+              threadId: projection.thread.id,
+              targetProviderInstanceId: targetModelSelection.instanceId,
+              cause:
+                "The pinned source role cannot be verified because its provider is unavailable. Explicitly select a replacement Agent for a fresh context.",
+            });
+          let sourceRequiresFreshContext = false;
+          if (
+            Option.isSome(sourceAdapter) &&
+            sourceAdapter.value.validateContextTransfer &&
+            (priorRun !== undefined ||
+              activeProviderThread?.nativeThreadRef != null ||
+              currentSessions.length > 0) &&
+            Option.isSome(targetInstance)
+          ) {
+            const sourceSelection = sourceSelectionKnown
+              ? current
+              : negotiatedCapabilities?.sessions.supportsMultipleProviderThreadsPerSession === true
+                ? { instanceId: current.instanceId, model: current.model }
+                : null;
+            sourceRequiresFreshContext = (yield* sourceAdapter.value.validateContextTransfer({
+              providerSessionId:
+                activeProviderThread?.providerSessionId ?? currentSession?.id ?? null,
+              modelSelection: sourceSelection,
+              targetModelSelection,
+              targetDriver: targetInstance.value.driver,
+            })).requiresFreshProviderThread;
+          }
+          if (
+            Option.isSome(targetAdapter) &&
+            targetAdapter.value.validateContextTransfer &&
+            Option.isSome(targetInstance)
+          )
+            yield* targetAdapter.value.validateContextTransfer({
+              providerSessionId: null,
+              modelSelection: targetModelSelection,
+              targetModelSelection,
+              targetDriver: targetInstance.value.driver,
+            });
+          const requiresSessionIsolation =
+            Option.isSome(targetInstance) &&
+            targetInstance.value.capabilities.sessions.supportsMultipleProviderThreadsPerSession &&
+            (negotiatedCapabilities?.sessions.supportsMultipleProviderThreadsPerSession === true ||
+              currentModelSelectionKnown === false) &&
+            Option.isSome(targetAdapter) &&
+            !(yield* targetAdapter.value.getCapabilities(targetModelSelection)).sessions
+              .supportsMultipleProviderThreadsPerSession;
           const currentProviderThread = projection.providerThreads.find(
             (thread) =>
               thread.id === projection.thread.activeProviderThreadId &&
@@ -99,10 +192,11 @@ export const layer: Layer.Layer<
               thread.nativeThreadRef !== null,
           );
           const selectionTransition =
-            current.instanceId === targetModelSelection.instanceId &&
             !modelSelectionsEqual(current, targetModelSelection) &&
             Option.isSome(targetAdapter) &&
             Option.isSome(currentInstance) &&
+            Option.isSome(targetInstance) &&
+            currentInstance.value.driver === targetInstance.value.driver &&
             (currentSession !== undefined || currentProviderThread !== undefined)
               ? yield* targetAdapter.value.planSelectionTransition({
                   current,
@@ -116,42 +210,46 @@ export const layer: Layer.Layer<
                   type: "reject",
                   reason: "The target provider instance is unavailable.",
                 } as const)
-              : decideProviderSessionTransition({
-                  current:
-                    Option.isNone(currentInstance) ||
-                    (currentSession === undefined && currentProviderThread === undefined)
-                      ? null
-                      : {
-                          driver: currentInstance.value.driver,
-                          continuationIdentity: {
-                            driverKind: currentInstance.value.driver,
-                            continuationKey: currentInstance.value.continuationKey,
+              : (requiresSessionIsolation || sourceRequiresFreshContext) &&
+                  targetInstance.value.enabled &&
+                  selectionTransition?.type !== "reject"
+                ? ({ type: "create_with_handoff" } as const)
+                : decideProviderSessionTransition({
+                    current:
+                      Option.isNone(currentInstance) ||
+                      (currentSession === undefined && currentProviderThread === undefined)
+                        ? null
+                        : {
+                            driver: currentInstance.value.driver,
+                            continuationIdentity: {
+                              driverKind: currentInstance.value.driver,
+                              continuationKey: currentInstance.value.continuationKey,
+                            },
+                            modelSelection: current,
+                            runtimeMode: projection.thread.runtimeMode,
+                            interactionMode: projection.thread.interactionMode,
+                            workspace:
+                              currentSession?.cwd ??
+                              projection.thread.worktreePath ??
+                              "<unresolved-workspace>",
                           },
-                          modelSelection: current,
-                          runtimeMode: projection.thread.runtimeMode,
-                          interactionMode: projection.thread.interactionMode,
-                          workspace:
-                            currentSession?.cwd ??
-                            projection.thread.worktreePath ??
-                            "<unresolved-workspace>",
-                        },
-                  target: {
-                    driver: targetInstance.value.driver,
-                    continuationIdentity: {
-                      driverKind: targetInstance.value.driver,
-                      continuationKey: targetInstance.value.continuationKey,
+                    target: {
+                      driver: targetInstance.value.driver,
+                      continuationIdentity: {
+                        driverKind: targetInstance.value.driver,
+                        continuationKey: targetInstance.value.continuationKey,
+                      },
+                      modelSelection: targetModelSelection,
+                      runtimeMode: projection.thread.runtimeMode,
+                      interactionMode: projection.thread.interactionMode,
+                      workspace:
+                        projection.thread.worktreePath ??
+                        currentSession?.cwd ??
+                        "<unresolved-workspace>",
+                      available: targetInstance.value.enabled,
                     },
-                    modelSelection: targetModelSelection,
-                    runtimeMode: projection.thread.runtimeMode,
-                    interactionMode: projection.thread.interactionMode,
-                    workspace:
-                      projection.thread.worktreePath ??
-                      currentSession?.cwd ??
-                      "<unresolved-workspace>",
-                    available: targetInstance.value.enabled,
-                  },
-                  ...(selectionTransition === undefined ? {} : { selectionTransition }),
-                });
+                    ...(selectionTransition === undefined ? {} : { selectionTransition }),
+                  });
           if (transition.type === "reject") {
             return yield* new ProviderSwitchPlanError({
               threadId: projection.thread.id,
@@ -167,13 +265,20 @@ export const layer: Layer.Layer<
                 return session.id === currentSession?.id;
               }
               if (transition.type === "create_with_handoff") {
-                return session.providerInstanceId !== targetModelSelection.instanceId;
+                return (
+                  session.providerInstanceId !== targetModelSelection.instanceId ||
+                  (!instanceChanged && session.id === currentSession?.id)
+                );
               }
               return false;
             })
             .map((session) => session.id);
           return {
             instanceChanged,
+            requiresFreshProviderThread:
+              requiresSessionIsolation ||
+              sourceRequiresFreshContext ||
+              selectionTransition?.type === "create_with_handoff",
             releaseProviderSessionIds,
             transition,
           };

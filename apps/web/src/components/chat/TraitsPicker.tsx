@@ -167,6 +167,7 @@ function getSelectedTraits(
 
   return {
     caps,
+    modelOptions,
     descriptors,
     selectDescriptors,
     booleanDescriptors,
@@ -363,6 +364,7 @@ export function useTraitsSelection({
       updateModelOptions(
         buildProviderOptionSelectionsFromDescriptors(
           replaceDescriptorCurrentValue(selected.descriptors, descriptorId, value),
+          modelOptions,
         ),
       );
     },

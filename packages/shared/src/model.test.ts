@@ -5,6 +5,7 @@ import {
   applyClaudePromptEffortPrefix,
   buildExplicitProviderOptionSelectionsFromDescriptors,
   buildProviderOptionSelectionsFromDescriptors,
+  carryProviderAgentSelection,
   createModelCapabilities,
   createModelSelection,
   getProviderOptionCurrentLabel,
@@ -34,6 +35,101 @@ const codexCaps: ModelCapabilities = createModelCapabilities({
 });
 
 describe("descriptor helpers", () => {
+  it("carries the explicit agent while retaining target model options and clearing stale roles", () => {
+    const targetSelections = [
+      { id: "agent", value: "old-role" },
+      { id: "reasoningEffort", value: "high" },
+    ];
+    expect(
+      carryProviderAgentSelection({
+        targetSelections,
+        currentSelections: [{ id: "agent", value: "mason" }],
+      }),
+    ).toEqual([
+      { id: "reasoningEffort", value: "high" },
+      { id: "agent", value: "mason" },
+    ]);
+    expect(carryProviderAgentSelection({ targetSelections, currentSelections: undefined })).toEqual(
+      [{ id: "reasoningEffort", value: "high" }],
+    );
+  });
+
+  it.each([
+    { raw: "mason", choices: ["default", "mason@aabb"], expected: "mason@aabb" },
+    { raw: "mason@aabb", choices: ["build", "mason"], expected: "mason@aabb" },
+    { raw: "mason@stale", choices: ["default", "mason@aabb"], expected: "mason@stale" },
+    { raw: "missing", choices: ["default"], expected: "missing" },
+    { raw: "mason@aabb", choices: [], expected: "mason@aabb" },
+  ])(
+    "preserves role authority across catalog normalization: $raw",
+    ({ raw, choices, expected }) => {
+      const selections = [{ id: "agent", value: raw }];
+      const descriptors = choices.length
+        ? [
+            {
+              id: "agent",
+              label: "Agent",
+              type: "select" as const,
+              currentValue: choices[0],
+              options: choices.map((id) => ({ id, label: id })),
+            },
+          ]
+        : [];
+      expect(buildExplicitProviderOptionSelectionsFromDescriptors(descriptors, selections)).toEqual(
+        [{ id: "agent", value: expected }],
+      );
+    },
+  );
+
+  it("shows an unavailable role instead of a default label for a stale selection", () => {
+    const selection = createModelSelection(ProviderInstanceId.make("codex"), "gpt-6.1-sol", [
+      { id: "agent", value: "mason@stale" },
+    ]);
+    const descriptor = {
+      id: "agent",
+      label: "Agent",
+      type: "select" as const,
+      currentValue: "mason@stale",
+      options: [{ id: "default", label: "Default" }],
+    };
+    expect(getProviderOptionCurrentLabel(descriptor, selection)).toBe("Unavailable: mason@stale");
+  });
+
+  it("retains a missing custom Agent when other traits change and honors explicit Default", () => {
+    const role = [{ id: "agent", value: "mason@pinned" }];
+    expect(
+      buildProviderOptionSelectionsFromDescriptors(
+        [
+          {
+            id: "effort",
+            label: "Effort",
+            type: "select",
+            options: [{ id: "high", label: "High" }],
+            currentValue: "high",
+          },
+        ],
+        role,
+      ),
+    ).toEqual([
+      { id: "effort", value: "high" },
+      { id: "agent", value: "mason@pinned" },
+    ]);
+    expect(
+      buildProviderOptionSelectionsFromDescriptors(
+        [
+          {
+            id: "agent",
+            label: "Agent",
+            type: "select",
+            options: [{ id: "default", label: "Default" }],
+            currentValue: "default",
+          },
+        ],
+        role,
+      ),
+    ).toEqual([{ id: "agent", value: "default" }]);
+  });
+
   it("builds dispatch options only from explicit selections", () => {
     const descriptors = getProviderOptionDescriptors({
       caps: codexCaps,

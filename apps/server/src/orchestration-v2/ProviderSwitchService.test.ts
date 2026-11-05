@@ -15,7 +15,7 @@ import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import { acpSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 import * as ProviderSwitch from "./ProviderSwitchService.ts";
-import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const driver = ProviderDriverKind.make("codex");
 const currentInstanceId = ProviderInstanceId.make("codex_primary");
@@ -66,16 +66,25 @@ function deadSessionRecord(
 }
 
 function layerTest(
-  metadata: Readonly<Record<string, { continuationKey: string }>>,
+  metadata: Readonly<Record<string, { continuationKey: string; driver?: typeof driver }>>,
   planSelectionTransition: ProviderAdapter.ProviderAdapterV2["Service"]["planSelectionTransition"] = () =>
     Effect.succeed({ type: "restart_session" }),
+  getCapabilities: ProviderAdapter.ProviderAdapterV2["Service"]["getCapabilities"] = () =>
+    Effect.succeed(capabilitiesWithoutModelSwitch),
+  registryCapabilities: OrchestrationV2ThreadProjection["providerSessions"][number]["capabilities"] = capabilitiesWithoutModelSwitch,
+  validateContextTransfer?: NonNullable<
+    ProviderAdapter.ProviderAdapterV2["Service"]["validateContextTransfer"]
+  >,
 ) {
   const adapter = (
     instanceId: ProviderInstanceId,
   ): ProviderAdapter.ProviderAdapterV2["Service"] => ({
     instanceId,
-    driver,
-    getCapabilities: () => Effect.succeed(capabilitiesWithoutModelSwitch),
+    driver: metadata[instanceId]?.driver ?? driver,
+    ...(instanceId === currentInstanceId && validateContextTransfer
+      ? { validateContextTransfer }
+      : {}),
+    getCapabilities,
     planSelectionTransition,
     openSession: () => Effect.die("ProviderSwitchService tests do not open sessions."),
   });
@@ -94,10 +103,10 @@ function layerTest(
             new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
           )
         : Effect.succeed({
-            driver,
+            driver: value.driver ?? driver,
             continuationKey: value.continuationKey,
             enabled: true,
-            capabilities: capabilitiesWithoutModelSwitch,
+            capabilities: registryCapabilities,
           });
     },
   });
@@ -158,7 +167,7 @@ it.effect("creates a fresh session with handoff when every recorded session is d
 
 function deadNativeThreadProjection(
   status: "stopped" | "error",
-  capabilities = capabilitiesWithoutModelSwitch,
+  capabilities: OrchestrationV2ThreadProjection["providerSessions"][number]["capabilities"] = capabilitiesWithoutModelSwitch,
 ): OrchestrationV2ThreadProjection {
   const thread = projection();
   return {
@@ -295,4 +304,267 @@ it.effect("distinguishes compatible and incompatible instances of the same drive
       }),
     ),
   ),
+);
+
+it.effect("releases the active native binding when a role replaces a same-instance session", () =>
+  Effect.gen(function* () {
+    const service = yield* ProviderSwitch.ProviderSwitchServiceV2;
+    const thread = deadNativeThreadProjection("stopped");
+    const result = yield* service.plan({
+      projection: {
+        ...thread,
+        providerSessions: [
+          { ...thread.providerSessions[0]!, status: "ready", updatedAt: now },
+          {
+            ...thread.providerSessions[0]!,
+            id: ProviderSessionId.make("unrelated_newer_session"),
+            status: "ready",
+            updatedAt: DateTime.add(now, { seconds: 1 }),
+          },
+        ],
+      },
+      targetModelSelection: {
+        ...thread.thread.modelSelection,
+        options: [{ id: "agent", value: "reviewer" }],
+      },
+    });
+    assert.equal(result.transition.type, "create_with_handoff");
+    assert.deepEqual(result.releaseProviderSessionIds, [ProviderSessionId.make("dead_session")]);
+  }).pipe(
+    Effect.provide(
+      layerTest({ [currentInstanceId]: { continuationKey: "codex:account:primary" } }, () =>
+        Effect.succeed({ type: "create_with_handoff" }),
+      ),
+    ),
+  ),
+);
+
+it.effect("honors role handoff across compatible provider instances", () =>
+  Effect.gen(function* () {
+    const service = yield* ProviderSwitch.ProviderSwitchServiceV2;
+    const result = yield* service.plan({
+      projection: projection(),
+      targetModelSelection: {
+        instanceId: ProviderInstanceId.make("codex_overlay"),
+        model: "gpt-5.1-codex",
+        options: [{ id: "agent", value: "reviewer" }],
+      },
+    });
+    assert.equal(result.transition.type, "create_with_handoff");
+    assert.deepEqual(result.releaseProviderSessionIds, [currentSessionId]);
+  }).pipe(
+    Effect.provide(
+      layerTest(
+        {
+          [currentInstanceId]: { continuationKey: "codex:account:primary" },
+          codex_overlay: { continuationKey: "codex:account:primary" },
+        },
+        () => Effect.succeed({ type: "create_with_handoff" }),
+      ),
+    ),
+  ),
+);
+
+it.effect.each([true, false])(
+  "isolates a runless native binding with pooled=%s after its picker selected a role",
+  (pooled) =>
+    Effect.gen(function* () {
+      const service = yield* ProviderSwitch.ProviderSwitchServiceV2;
+      const thread = deadNativeThreadProjection("stopped", {
+        ...CodexProviderCapabilitiesV2,
+        sessions: {
+          ...CodexProviderCapabilitiesV2.sessions,
+          supportsMultipleProviderThreadsPerSession: pooled,
+        },
+      });
+      const target = {
+        ...thread.thread.modelSelection,
+        options: [{ id: "agent", value: "reviewer" }],
+      };
+      const result = yield* service.plan({
+        projection: { ...thread, thread: { ...thread.thread, modelSelection: target } },
+        targetModelSelection: target,
+        currentModelSelectionKnown: false,
+      });
+      assert.equal(result.transition.type, "create_with_handoff");
+      assert.isTrue(result.requiresFreshProviderThread);
+    }).pipe(
+      Effect.provide(
+        layerTest(
+          { [currentInstanceId]: { continuationKey: "codex:account:primary" } },
+          () => Effect.succeed({ type: "apply_on_next_turn" }),
+          () =>
+            Effect.succeed({
+              ...CodexProviderCapabilitiesV2,
+              sessions: {
+                ...CodexProviderCapabilitiesV2.sessions,
+                supportsMultipleProviderThreadsPerSession: false,
+              },
+            }),
+        ),
+      ),
+    ),
+);
+
+it.effect("preserves an ordinary dedicated native import with unknown prior selection", () =>
+  Effect.gen(function* () {
+    const service = yield* ProviderSwitch.ProviderSwitchServiceV2;
+    const capabilities = {
+      ...CodexProviderCapabilitiesV2,
+      sessions: {
+        ...CodexProviderCapabilitiesV2.sessions,
+        supportsMultipleProviderThreadsPerSession: false,
+      },
+    };
+    const thread = deadNativeThreadProjection("stopped", capabilities);
+    const result = yield* service.plan({
+      projection: thread,
+      targetModelSelection: thread.thread.modelSelection,
+      currentModelSelectionKnown: false,
+    });
+    assert.equal(result.transition.type, "reuse");
+    assert.isFalse(result.requiresFreshProviderThread);
+  }).pipe(
+    Effect.provide(
+      layerTest(
+        { [currentInstanceId]: { continuationKey: "codex:account:primary" } },
+        () => Effect.succeed({ type: "apply_on_next_turn" }),
+        () =>
+          Effect.succeed({
+            ...CodexProviderCapabilitiesV2,
+            sessions: {
+              ...CodexProviderCapabilitiesV2.sessions,
+              supportsMultipleProviderThreadsPerSession: false,
+            },
+          }),
+        {
+          ...CodexProviderCapabilitiesV2,
+          sessions: {
+            ...CodexProviderCapabilitiesV2.sessions,
+            supportsMultipleProviderThreadsPerSession: false,
+          },
+        },
+      ),
+    ),
+  ),
+);
+
+it.effect.each([false, true])(
+  "validates the authoritative source before cross-provider role carry after picker changes (stale=%s)",
+  (stale) =>
+    Effect.gen(function* () {
+      const targetId = ProviderInstanceId.make("opencode");
+      const source = {
+        instanceId: currentInstanceId,
+        model: "gpt-5.1-codex",
+        options: [{ id: "agent", value: "mason@old-profile" }],
+      };
+      const target = {
+        instanceId: targetId,
+        model: source.model,
+        options: [{ id: "agent", value: "mason" }],
+      };
+      const base = deadNativeThreadProjection("stopped");
+      const seen: Array<unknown> = [];
+      const program = Effect.gen(function* () {
+        const service = yield* ProviderSwitch.ProviderSwitchServiceV2;
+        const plan = service.plan({
+          projection: {
+            ...base,
+            thread: { ...base.thread, modelSelection: target },
+            runs: [
+              {
+                providerThreadId: base.thread.activeProviderThreadId,
+                modelSelection: source,
+                status: "completed",
+              },
+            ],
+          },
+          targetModelSelection: target,
+        });
+        if (stale) {
+          const failure = yield* plan.pipe(Effect.flip);
+          assert.equal(failure._tag, "ProviderSwitchPlanError");
+        } else assert.equal((yield* plan).transition.type, "create_with_handoff");
+        assert.deepEqual(seen, [
+          {
+            providerSessionId: ProviderSessionId.make("dead_session"),
+            modelSelection: source,
+            targetModelSelection: target,
+            targetDriver: ProviderDriverKind.make("opencode"),
+          },
+        ]);
+      });
+      yield* program.pipe(
+        Effect.provide(
+          layerTest(
+            {
+              [currentInstanceId]: { continuationKey: "codex:account:primary" },
+              [targetId]: {
+                continuationKey: "opencode:account:primary",
+                driver: ProviderDriverKind.make("opencode"),
+              },
+            },
+            undefined,
+            undefined,
+            undefined,
+            (input) => {
+              seen.push(input);
+              return stale
+                ? Effect.fail(
+                    new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver,
+                      detail: "The source profile changed.",
+                    }),
+                  )
+                : Effect.succeed({ requiresFreshProviderThread: true });
+            },
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "rejects implicit revision carry from an unavailable source but permits explicit Default recovery",
+  () =>
+    Effect.gen(function* () {
+      const service = yield* ProviderSwitch.ProviderSwitchServiceV2;
+      const targetId = ProviderInstanceId.make("codex_replacement");
+      const source = {
+        instanceId: currentInstanceId,
+        model: "gpt-5.1-codex",
+        options: [{ id: "agent", value: "mason@old-profile" }],
+      };
+      const base = deadNativeThreadProjection("stopped");
+      const sourceProjection = {
+        ...base,
+        thread: { ...base.thread, modelSelection: source },
+        runs: [
+          {
+            providerThreadId: base.thread.activeProviderThreadId!,
+            modelSelection: source,
+            status: "completed" as const,
+          },
+        ],
+      };
+      const failure = yield* service
+        .plan({
+          projection: sourceProjection,
+          targetModelSelection: { ...source, instanceId: targetId },
+        })
+        .pipe(Effect.flip);
+      assert.equal(failure._tag, "ProviderSwitchPlanError");
+      const recovered = yield* service.plan({
+        projection: sourceProjection,
+        targetModelSelection: { instanceId: targetId, model: source.model },
+      });
+      assert.equal(recovered.transition.type, "create_with_handoff");
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          codex_replacement: { continuationKey: "codex:replacement" },
+        }),
+      ),
+    ),
 );

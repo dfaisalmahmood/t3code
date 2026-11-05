@@ -20,6 +20,7 @@ import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import { liveThreadShell } from "./McpToolAccess.testkit.ts";
 
@@ -465,4 +466,34 @@ it.effect("refuses a linked environment to a tool that acts as its calling threa
     ).pipe(Effect.scoped, Effect.exit);
     expect(Exit.isFailure(built) && Cause.hasDies(built.cause)).toBe(true);
   }),
+);
+
+it.effect("enforces the pinned tool ceiling for direct calls and fences captured old scopes", () =>
+  Effect.gen(function* () {
+    const sessions = yield* McpProviderSessions.McpProviderSessions;
+    const scope = { ...fullAccess, allowedToolNames: ["reads"], providerCredential: true as const };
+    const config = {
+      environmentId: scope.environmentId,
+      threadId: fullAccessThreadId,
+      providerSessionId: scope.requestNamespace,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      endpoint: "http://127.0.0.1/mcp",
+      authorizationHeader: "Bearer test",
+      browserToolsAvailable: false,
+      allowedToolNames: ["reads"],
+    };
+    yield* sessions.set(config);
+    expect(yield* call("reads", scope)).toBe("ran");
+    expect(yield* call("writes", scope)).toBe("capability_denied");
+    yield* sessions.set({ ...config, providerSessionId: "new-generation" });
+    expect(yield* call("reads", scope)).toBe("capability_denied");
+  }).pipe(
+    Effect.provide(
+      probeServer(
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
+        }),
+      ).pipe(Layer.provideMerge(McpProviderSessions.layer)),
+    ),
+  ),
 );

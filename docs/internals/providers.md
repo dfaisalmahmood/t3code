@@ -163,3 +163,37 @@ The logger filters those notifications before traversal when an older provider s
 
 Model classification has its own [manifest constraints](./model-manifest.md). Assistant-reference
 handling is documented under [citations](./assistant-citations.md).
+
+## Codex role isolation
+
+A management role is a compiled pair of installed instruction and permission
+files, identified by a digest of both. Its native process must be dedicated.
+The ordinary Codex pool can continue serving other threads during a role handoff;
+changing one thread's role must revoke only that thread's old MCP credential.
+
+The role lives in native `developerInstructions` as well as bounded application
+context. The qualified Codex runtime rebuilds native developer instructions before
+post-compaction inference. Application-context restoration alone cannot establish
+that ordering because notification handling must let the response reader run.
+Warm native resume can ignore new configuration, so a role change requires a new
+native context. A resume acknowledgement is not proof that the policy changed.
+
+The role compiler's native version and effective-config checks are enforcement
+gates. Extending the supported runtime needs native tool and compaction evidence,
+including an ordinary control and a positive scoped MCP call. An enabled-tool
+list without endpoint authorization does not constrain direct HTTP calls.
+
+Context transfer validates the source selection from the last executed run bound
+to the native thread, rather than an already-edited picker value. A live Codex
+session also pins its compiled profile and reloads its files before same-role
+carry. Cold carry revalidates the persisted revision. Explicit replacement or
+Default uses a fresh context and fences the old credential, so deleted profiles
+do not trap a thread. A qualified Codex revision remains unavailable on bare-ID
+target providers until the user explicitly selects the target Agent; target
+catalog membership alone cannot attest matching profile bytes.
+
+Native forks retain source developer messages even when fork overrides supply
+new instructions. Management-role sources and targets therefore use a new native
+thread with a factual portable handoff. Ordinary Default-to-Default forks retain
+the existing native path. Both planning and execution check source and target
+capabilities against the authoritative source run.

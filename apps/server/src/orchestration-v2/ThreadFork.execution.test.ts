@@ -434,11 +434,58 @@ it.effect.each(forkCases)(
 );
 
 it.effect.each([
-  { execution: "portable_context", rejected: true },
-  { execution: "native_fork", rejected: false },
+  {
+    execution: "portable_context",
+    rejected: true,
+    driverName: "claudeAgent",
+    sourceRole: undefined,
+    targetRole: undefined,
+  },
+  {
+    execution: "native_fork",
+    rejected: false,
+    driverName: "claudeAgent",
+    sourceRole: undefined,
+    targetRole: undefined,
+  },
+  {
+    execution: "native_fork",
+    rejected: false,
+    driverName: "codex",
+    sourceRole: undefined,
+    targetRole: undefined,
+  },
+  {
+    execution: "portable_context",
+    rejected: true,
+    driverName: "codex",
+    sourceRole: "mason",
+    targetRole: undefined,
+  },
+  {
+    execution: "portable_context",
+    rejected: true,
+    driverName: "codex",
+    sourceRole: undefined,
+    targetRole: "nolan",
+  },
+  {
+    execution: "portable_context",
+    rejected: true,
+    driverName: "codex",
+    sourceRole: "mason",
+    targetRole: "nolan",
+  },
+  {
+    execution: "portable_context",
+    rejected: true,
+    driverName: "codex",
+    sourceRole: "mason",
+    targetRole: "mason",
+  },
 ] as const)(
-  "a $execution fork's first /compact is rejected only when no history reaches it: $rejected",
-  ({ execution, rejected }) => {
+  "a $driverName fork from role=$sourceRole to role=$targetRole uses $execution before its first /compact",
+  ({ execution, rejected, driverName, sourceRole, targetRole }) => {
     const opened: Array<ProviderInstanceId> = [];
     const adapter = (driverName: "claudeAgent" | "codex") => {
       const driver = ProviderDriverKind.make(driverName);
@@ -446,10 +493,22 @@ it.effect.each([
       return {
         instanceId,
         driver,
-        getCapabilities: () =>
-          Effect.succeed(
-            driver === "codex" ? CodexProviderCapabilitiesV2 : ClaudeProviderCapabilitiesV2,
-          ),
+        getCapabilities: (selection) => {
+          const capabilities =
+            driver === "codex" ? CodexProviderCapabilitiesV2 : ClaudeProviderCapabilitiesV2;
+          return Effect.succeed(
+            selection?.options?.some((option) => option.id === "agent")
+              ? {
+                  ...capabilities,
+                  threads: {
+                    ...capabilities.threads,
+                    canForkThread: false,
+                    canForkFromTurn: false,
+                  },
+                }
+              : capabilities,
+          );
+        },
         planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
         openSession: (input) =>
           Effect.sync(() => opened.push(instanceId)).pipe(
@@ -462,8 +521,9 @@ it.effect.each([
           ),
       } satisfies ProviderAdapter.ProviderAdapterV2["Service"];
     };
-    const claude = adapter("claudeAgent");
-    const target = execution === "portable_context" ? adapter("codex") : claude;
+    const claude = adapter(driverName);
+    const target =
+      execution === "portable_context" && driverName !== "codex" ? adapter("codex") : claude;
     return Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const eventSink = yield* EventSink.EventSinkV2;
@@ -474,7 +534,11 @@ it.effect.each([
       const providerThreadId = ProviderThreadId.make("fork-compact-native-thread");
       const sourceRunId = RunId.make("fork-compact-source-run");
       const userMessageId = MessageId.make("fork-compact-source-message");
-      const sourceSelection = { instanceId: claude.instanceId, model: "test-model" };
+      const sourceSelection = {
+        instanceId: claude.instanceId,
+        model: "test-model",
+        ...(sourceRole === undefined ? {} : { options: [{ id: "agent", value: sourceRole }] }),
+      };
 
       yield* orchestrator.dispatch({
         type: "thread.create",
@@ -597,6 +661,13 @@ it.effect.each([
           },
         ],
       });
+      if (sourceRole !== undefined)
+        yield* orchestrator.dispatch({
+          type: "thread.model-selection.set",
+          commandId: CommandId.make("fork-compact-picker"),
+          threadId: sourceThreadId,
+          modelSelection: { instanceId: claude.instanceId, model: "test-model" },
+        });
       yield* orchestrator.dispatch({
         type: "thread.fork",
         commandId: CommandId.make("fork-compact-fork"),
@@ -613,7 +684,11 @@ it.effect.each([
         messageId: MessageId.make("fork-compact-compact"),
         text: "/compact",
         attachments: [],
-        modelSelection: { instanceId: target.instanceId, model: "test-model" },
+        modelSelection: {
+          instanceId: target.instanceId,
+          model: "test-model",
+          ...(targetRole === undefined ? {} : { options: [{ id: "agent", value: targetRole }] }),
+        },
         dispatchMode: { type: "start_immediately" },
         createdBy: "user",
         creationSource: "web",
